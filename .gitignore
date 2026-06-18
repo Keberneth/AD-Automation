@@ -1,0 +1,13 @@
+# Real environment settings (never commit domain details / recipients).
+config/AD-Automation.settings.psd1
+config/AD-Automation.settings.json
+
+# Local runtime output (logs, CSV reports, approval drafts, state, credentials).
+output/
+*.log
+*.cred
+
+# OS / editor noise
+Thumbs.db
+desktop.ini
+.DS_Store

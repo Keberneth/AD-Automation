@@ -1,234 +1,220 @@
 <#
 .SYNOPSIS
-Notify users and admins of upcoming AD password expirations.
+Notify users (and admins) of upcoming Active Directory password expirations.
 
 .DESCRIPTION
-Finds enabled users whose passwords will expire within a specified window
-and sends email notifications to:
-- the user (if mail attribute exists)
-- administrators (summary CSV)
+Finds enabled users whose password will expire within a window and e-mails:
+  - the user (if a 'mail' attribute exists)
+  - an admin summary CSV (AdminMailTo)
 
-USAGE
-  # Dry run (no email) with CSV/log
-  .\Invoke-ADPasswordExpiryNotify.ps1 -DryRun
+Works against ANY domain: with no OUs configured it searches the whole current
+domain. All defaults can be set once in config\AD-Automation.settings.psd1
+(section 'PasswordExpiryNotify') - no need to edit this script. Anything passed
+on the command line overrides the config file.
 
-  # Send emails for users expiring within 14 days
-  .\Invoke-ADPasswordExpiryNotify.ps1 -Run -NotifyWindowDays 14
+.PARAMETER ConfigPath
+Optional path to a settings .psd1/.json. Defaults to the module's config folder
+or the AD_AUTOMATION_CONFIG environment variable.
 
-  # Use custom day offsets (e.g., notify at 14,7,3,1)
-  .\Invoke-ADPasswordExpiryNotify.ps1 -Run -NotifyDays 14,7,3,1
+.EXAMPLE
+.\Invoke-ADPasswordExpiryNotify.ps1 -DryRun
+Dry run (no e-mail), writes CSV + log.
+
+.EXAMPLE
+.\Invoke-ADPasswordExpiryNotify.ps1 -Run -NotifyDays 14,7,3,1
+Send reminders only at exactly 14/7/3/1 calendar days remaining.
 
 .NOTES
-- Requires AD module and permissions to read users.
-- Uses msDS-UserPasswordExpiryTimeComputed.
+- Uses msDS-UserPasswordExpiryTimeComputed (handles "never expires" / PSO).
+- Output folder holds user PII; it is created with a restricted ACL.
+- Requires the ActiveDirectory module and the ADAutomation module (shipped alongside).
 #>
 
-[CmdletBinding(DefaultParameterSetName='DryRun')]
+[CmdletBinding(DefaultParameterSetName = 'DryRun')]
 param(
-  [Parameter(ParameterSetName='DryRun', Mandatory=$true)]
-  [switch]$DryRun,
+    [Parameter(ParameterSetName = 'DryRun', Mandatory = $true)][switch]$DryRun,
+    [Parameter(ParameterSetName = 'Run', Mandatory = $true)][switch]$Run,
 
-  [Parameter(ParameterSetName='Run', Mandatory=$true)]
-  [switch]$Run,
+    # Notify if the password expires within this many days.
+    [ValidateRange(1, 3650)][int]$NotifyWindowDays = 14,
 
-  # Notify if password expires within this many days
-  [int]$NotifyWindowDays = 14,
+    # Optional discrete reminder thresholds, e.g. 14,7,3,1 (whole calendar days remaining).
+    [int[]]$NotifyDays = @(),
 
-  # Optional: only notify on specific day offsets (e.g., 14,7,3,1)
-  [int[]]$NotifyDays = @(),
+    [ValidateSet('Base', 'OneLevel', 'Subtree')][string]$SearchScope = 'Subtree',
 
-  # SMTP settings
-  [string]$SmtpServer = "smtp-relay.contoso.local",
-  [int]$SmtpPort = 25,
-  [string]$MailFrom = "ad-password@contoso.local",
-  [string[]]$AdminMailTo = @("it-operations@contoso.local"),
-  [bool]$MailUseSsl = $false,
+    # Search bases. Empty = whole current domain.
+    [string[]]$UserLimitToOUs = @(),
 
-  # Output paths
-  [string]$OutputRoot = "C:\Temp\AD-PasswordExpiry",
-  [string]$LogFilePrefix = "ADPasswordExpiry",
+    [string[]]$IgnoreAccountsExact = @('Administrator', 'Guest', 'krbtgt'),
 
-  # Search scope (optional)
-  [string[]]$UserLimitToOUs = @(
-    "OU=Users,DC=contoso,DC=local",
-    "OU=Contractors,DC=contoso,DC=local"
-  ),
+    # SMTP / mail (usually set in [Common]).
+    [string]$SmtpServer = 'smtp-relay.contoso.local',
+    [int]$SmtpPort = 25,
+    [string]$MailFrom = 'ad-automation@contoso.local',
+    [bool]$MailUseSsl = $false,
+    [string]$MailCredentialPath = '',
+    [string[]]$AdminMailTo = @('it-operations@contoso.local'),
 
-  # Ignore accounts
-  [string[]]$IgnoreAccountsExact = @(
-    "Administrator",
-    "Guest",
-    "krbtgt"
-  )
+    # Target DC. Empty = auto-detect (PDC emulator).
+    [string]$Server = '',
+
+    [string]$OutputRoot = 'C:\ProgramData\AD-Automation',
+    [string]$LogFilePrefix = 'ADPasswordExpiry',
+
+    [string]$ConfigPath = ''
 )
 
-# ==== helpers ====
-function Write-Log {
-  param(
-    [Parameter(Mandatory=$true)][string]$Message,
-    [ValidateSet('INFO','WARN','ERROR','ACTION','WHATIF')][string]$Level = 'INFO'
-  )
-  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-  $line = "[$ts][$Level] $Message"
-  Write-Output $line
-  Add-Content -Path $script:LogPath -Value $line
-}
+# --- Bootstrap: shared module + external settings ---------------------------
+$modulePath = Join-Path $PSScriptRoot 'ADAutomation.psd1'
+if (-not (Test-Path -LiteralPath $modulePath)) { throw "Required module not found next to script: $modulePath" }
+Import-Module $modulePath -Force -ErrorAction Stop
 
-function Send-Email {
-  param(
-    [Parameter(Mandatory=$true)][string[]]$To,
-    [Parameter(Mandatory=$true)][string]$Subject,
-    [Parameter(Mandatory=$true)][string]$Body
-  )
-
-  try {
-    Send-MailMessage `
-      -SmtpServer $SmtpServer `
-      -Port $SmtpPort `
-      -From $MailFrom `
-      -To $To `
-      -Subject $Subject `
-      -Body $Body `
-      -BodyAsHtml:$false `
-      -UseSsl:$MailUseSsl `
-      -ErrorAction Stop
-
-    Write-Log "Email sent to '$($To -join ',')' Subject='$Subject'" 'ACTION'
-  } catch {
-    Write-Log "ERROR sending email: $($_.Exception.Message)" 'ERROR'
-  }
-}
-
-function Get-ValidSearchBases {
-  param([string[]]$Bases)
-  $valid = New-Object System.Collections.Generic.List[string]
-  foreach ($b in $Bases) {
-    if ([string]::IsNullOrWhiteSpace($b)) { continue }
-    try {
-      $null = Get-ADOrganizationalUnit -Identity $b -ErrorAction Stop
-      $valid.Add($b) | Out-Null
-    } catch {
-      Write-Log "Search base OU not found/invalid (skipping): $b" 'WARN'
+$cfg = Import-ADAutomationConfig -Path $ConfigPath -Section 'PasswordExpiryNotify'
+$boundKeys = @($PSBoundParameters.Keys)
+foreach ($k in @($cfg.Keys)) {
+    if ($k -eq '__ConfigFile') { continue }
+    if ($boundKeys -notcontains $k -and (Get-Variable -Name $k -Scope 0 -ErrorAction SilentlyContinue)) {
+        Set-Variable -Name $k -Value $cfg[$k] -Scope 0
     }
-  }
-  return $valid.ToArray()
 }
 
-# ==== setup ====
 if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-  throw "ActiveDirectory module not found. Install RSAT / AD PowerShell module."
+    throw 'ActiveDirectory module not found. Install RSAT / AD PowerShell module.'
 }
-Import-Module ActiveDirectory
+Import-Module ActiveDirectory -ErrorAction Stop
 
-New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
-$RunId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$script:LogPath = Join-Path $OutputRoot "$LogFilePrefix-$RunId.log"
-$CsvPath = Join-Path $OutputRoot "$LogFilePrefix-Report-$RunId.csv"
-New-Item -ItemType File -Force -Path $script:LogPath | Out-Null
+# --- Setup ------------------------------------------------------------------
+$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName $LogFilePrefix
+$CsvPath = Join-Path $OutputRoot ("{0}-Report-{1}.csv" -f $LogFilePrefix, $run.RunId)
 
-$whatIf = $PSCmdlet.ParameterSetName -eq 'DryRun'
+$whatIf = ($PSCmdlet.ParameterSetName -eq 'DryRun')
+
+if ([string]::IsNullOrWhiteSpace($Server)) {
+    try { $Server = (Get-ADAutomationDomainInfo).Server } catch { $Server = '' }
+}
+$srv = @{}
+if (-not [string]::IsNullOrWhiteSpace($Server)) { $srv['Server'] = $Server }
+
+$mailCommon = @{
+    From = $MailFrom; SmtpServer = $SmtpServer; SmtpPort = $SmtpPort
+    UseSsl = $MailUseSsl; CredentialPath = $MailCredentialPath
+}
+if ($SmtpServer -match '(?i)contoso\.') {
+    Write-ADAutomationLog "SmtpServer is still the sample 'contoso' placeholder; configure config\AD-Automation.settings.psd1." 'WARN'
+}
+
 $today = (Get-Date).Date
 $windowEnd = $today.AddDays($NotifyWindowDays)
 
-$userBases = Get-ValidSearchBases -Bases $UserLimitToOUs
+if (-not $UserLimitToOUs -or @($UserLimitToOUs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -eq 0) {
+    $UserLimitToOUs = @((Get-ADAutomationDomainInfo @srv).DistinguishedName)
+    Write-ADAutomationLog "No UserLimitToOUs supplied; defaulting to domain root: $($UserLimitToOUs -join ', ')" 'INFO'
+}
+$userBases = Get-ValidSearchBase -Bases $UserLimitToOUs @srv
+if (-not $userBases -or $userBases.Count -eq 0) {
+    throw "No valid AD search bases resolved from UserLimitToOUs ($($UserLimitToOUs -join ', ')). Provide OUs that exist in this domain."
+}
 
-Write-Log "=== START (RunId=$RunId) ==="
-Write-Log "Mode=$($PSCmdlet.ParameterSetName) ; WhatIf=$whatIf ; NotifyWindowDays=$NotifyWindowDays ; NotifyDays=$($NotifyDays -join ',')"
-Write-Log "OutputRoot=$OutputRoot ; CSV=$CsvPath ; Log=$script:LogPath"
-Write-Log "SMTP=$SmtpServer:$SmtpPort From=$MailFrom AdminTo=$($AdminMailTo -join ',') SSL=$MailUseSsl"
+Write-ADAutomationLog "=== START (RunId=$($run.RunId)) ==="
+Write-ADAutomationLog ("Mode={0} ; WhatIf={1} ; NotifyWindowDays={2} ; NotifyDays={3} ; SearchScope={4} ; Server={5}" -f `
+        $PSCmdlet.ParameterSetName, $whatIf, $NotifyWindowDays, ($NotifyDays -join ','), $SearchScope, $Server)
+Write-ADAutomationLog ("SMTP={0}:{1} From={2} SSL={3} AdminTo={4}" -f $SmtpServer, $SmtpPort, $MailFrom, $MailUseSsl, ($AdminMailTo -join ','))
 
 $report = New-Object System.Collections.Generic.List[object]
 
 foreach ($base in $userBases) {
-  Write-Log "Processing OU: $base"
-  $users = Get-ADUser -SearchBase $base -LDAPFilter "(&(objectCategory=person)(objectClass=user))" `
-    -Properties mail,Enabled,msDS-UserPasswordExpiryTimeComputed,PasswordNeverExpires,SamAccountName
-
-  foreach ($u in $users) {
-    if (-not $u.Enabled) { continue }
-    if ($u.PasswordNeverExpires) { continue }
-    if ($IgnoreAccountsExact -contains $u.SamAccountName) { continue }
-
-    $expiryFileTime = $u.'msDS-UserPasswordExpiryTimeComputed'
-    if (-not $expiryFileTime) { continue }
-
-    $expiry = [DateTime]::FromFileTime($expiryFileTime)
-    if ($expiry -gt $windowEnd) { continue }
-
-    $daysLeft = [int]([math]::Ceiling(($expiry - $today).TotalDays))
-    if ($daysLeft -lt 0) { continue }
-
-    if ($NotifyDays.Count -gt 0 -and ($NotifyDays -notcontains $daysLeft)) {
-      continue
+    Write-ADAutomationLog "Processing OU: $base"
+    try {
+        $users = Get-ADUser -SearchBase $base -SearchScope $SearchScope @srv `
+            -LDAPFilter '(&(objectCategory=person)(objectClass=user)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
+            -Properties mail, Enabled, 'msDS-UserPasswordExpiryTimeComputed', PasswordNeverExpires, SamAccountName -ErrorAction Stop
+    }
+    catch {
+        Write-ADAutomationLog "ERROR querying base '$base': $($_.Exception.Message)" 'ERROR'
+        continue
     }
 
-    $report.Add([pscustomobject]@{
-      SamAccountName = $u.SamAccountName
-      DisplayName    = $u.Name
-      Mail           = $u.mail
-      ExpiryDate     = $expiry
-      DaysLeft       = $daysLeft
-      OU             = $base
-    }) | Out-Null
+    foreach ($u in $users) {
+        try {
+            if (-not $u.Enabled) { continue }
+            if ($u.PasswordNeverExpires) { continue }
+            if (Test-IsIgnoredName -Name $u.SamAccountName -ExactList $IgnoreAccountsExact) { continue }
 
-    $subject = "Password expiry notice: $daysLeft day(s) remaining"
-    $body = @"
+            $expiryFileTime = $u.'msDS-UserPasswordExpiryTimeComputed'
+            # 0/null = must-change-now or unset; Int64.MaxValue = never expires (PSO/UAC). Both are non-convertible sentinels.
+            if ($null -eq $expiryFileTime -or $expiryFileTime -le 0 -or $expiryFileTime -ge [Int64]::MaxValue) { continue }
+
+            try { $expiry = [DateTime]::FromFileTime($expiryFileTime) }
+            catch {
+                Write-ADAutomationLog "Skipping $($u.SamAccountName): invalid expiry filetime '$expiryFileTime'." 'WARN'
+                continue
+            }
+
+            if ($expiry -gt $windowEnd) { continue }
+
+            # Whole calendar days remaining: "expires today" = 0, "expires in N days" = N.
+            $daysLeft = ($expiry.Date - $today).Days
+            if ($daysLeft -lt 0) { continue }
+            if ($NotifyDays.Count -gt 0 -and ($NotifyDays -notcontains $daysLeft)) { continue }
+
+            $report.Add([pscustomobject]@{
+                    SamAccountName = $u.SamAccountName
+                    DisplayName    = $u.Name
+                    Mail           = $u.mail
+                    ExpiryDate     = $expiry
+                    DaysLeft       = $daysLeft
+                    OU             = $base
+                }) | Out-Null
+
+            $subject = "Password expiry notice: $daysLeft day(s) remaining"
+            $body = @"
 Hello $($u.Name),
 
 Your Active Directory password will expire in $daysLeft day(s).
-Expiry date: $expiry
+Expiry date: $($expiry.ToString('yyyy-MM-dd HH:mm'))
 
 Please change your password before it expires to avoid login issues.
-
 If you need help, contact IT support.
 
 Thank you,
 IT Operations
 "@
 
-    if ($whatIf) {
-      Write-Log "WHATIF: Would email user '$($u.mail)' ($($u.SamAccountName)) DaysLeft=$daysLeft" 'WHATIF'
-    } else {
-      if ($u.mail) {
-        Send-Email -To @($u.mail) -Subject $subject -Body $body
-      } else {
-        Write-Log "No mail for $($u.SamAccountName); skipping user notification." 'WARN'
-      }
+            if ($whatIf) {
+                Write-ADAutomationLog "WHATIF: would notify '$($u.mail)' ($($u.SamAccountName)) DaysLeft=$daysLeft" 'WHATIF'
+            }
+            elseif ($u.mail) {
+                [void](Send-ADAutomationMail @mailCommon -To @($u.mail) -Subject $subject -Body $body)
+            }
+            else {
+                Write-ADAutomationLog "No mail for $($u.SamAccountName); skipping user notification." 'WARN'
+            }
+        }
+        catch {
+            Write-ADAutomationLog "Unexpected error processing '$($u.SamAccountName)': $($_.Exception.Message)" 'ERROR'
+            continue
+        }
     }
-  }
 }
 
-# Write CSV + admin summary
+# --- Reporting --------------------------------------------------------------
 try {
-  $report | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-  Write-Log "CSV report written: $CsvPath" 'INFO'
-} catch {
-  Write-Log "ERROR writing CSV report: $($_.Exception.Message)" 'ERROR'
+    $report | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
+    Write-ADAutomationLog "CSV report written: $CsvPath" 'INFO'
+}
+catch {
+    Write-ADAutomationLog "ERROR writing CSV report: $($_.Exception.Message)" 'ERROR'
 }
 
-if (-not $whatIf -and $AdminMailTo.Count -gt 0 -and (Test-Path $CsvPath)) {
-  $subject = "AD Password Expiry Summary ($($today.ToString('yyyy-MM-dd')))"
-  $body = "Attached is the password expiry notification summary CSV."
-  try {
-    Send-MailMessage `
-      -SmtpServer $SmtpServer `
-      -Port $SmtpPort `
-      -From $MailFrom `
-      -To $AdminMailTo `
-      -Subject $subject `
-      -Body $body `
-      -Attachments $CsvPath `
-      -BodyAsHtml:$false `
-      -UseSsl:$MailUseSsl `
-      -ErrorAction Stop
-    Write-Log "Admin summary email sent." 'ACTION'
-  } catch {
-    Write-Log "ERROR sending admin summary email: $($_.Exception.Message)" 'ERROR'
-  }
+if (-not $whatIf -and @($AdminMailTo).Count -gt 0 -and (Test-Path -LiteralPath $CsvPath)) {
+    [void](Send-ADAutomationMail @mailCommon -To $AdminMailTo `
+            -Subject ("AD Password Expiry Summary ({0}) - {1} user(s)" -f $today.ToString('yyyy-MM-dd'), $report.Count) `
+            -Body 'Attached is the password expiry notification summary CSV.' `
+            -Attachments @($CsvPath))
 }
 
-Write-Log "=== END ==="
-Write-Output "Done."
-Write-Output "Mode: $($PSCmdlet.ParameterSetName)"
-Write-Output "Log: $script:LogPath"
+Write-ADAutomationLog "=== END (notified=$($report.Count)) ==="
+Write-Output "Done. Mode=$($PSCmdlet.ParameterSetName) Notified=$($report.Count)"
+Write-Output "Log: $($run.LogPath)"
 Write-Output "CSV: $CsvPath"

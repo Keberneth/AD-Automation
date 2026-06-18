@@ -1,618 +1,346 @@
 <#
 .SYNOPSIS
-Invoke-ADHygieneDeleteDisabledUsers.ps1
+Delete AD user accounts that have been DISABLED for at least N days (default 180).
 
-Deletes AD user accounts that have been DISABLED for N days (default 180), with:
-- Modes: -DryRun, -Run, -Scheduled
-- Optional approval gating: -RequireApprovalList
-- Full logging (decisions + actions + errors)
-- CSV report output
-- Draft approval list generation (from eligible candidates)
-- Optional email sending of CSV + approval draft + log via unauthenticated SMTP relay (-EmailApprovalList)
+.DESCRIPTION
+Modes: -DryRun (no changes), -Run (interactive), -Scheduled (unattended).
 
-.NOTES / IMPORTANT
-1) “Disabled since” is not a first-class replicated timestamp in AD by default. This script can determine the disable time using:
-   - Replication metadata on userAccountControl (recommended): Get-ADReplicationAttributeMetadata
-   - whenChanged (fallback; NOT replicated and may reflect replication timing or later edits)
-   - A stamped attribute (best if you already stamp on disable via your disable script)
+Safety is AUTOMATIC - no list to maintain, no per-run busy-work:
+  - Run -DryRun first to preview exactly what would be deleted (changes nothing).
+  - Only accounts DISABLED for at least -DisabledForDays (default 180) are eligible.
+  - -MaxDeletes caps deletions per run (default 25) as a surge brake; -Unlimited lifts it.
+  - Ignore lists protect built-in/critical accounts; an unreliable disable date is skipped.
+  - -RequireApprovalList is OPTIONAL - use it ONLY if you want manual change-control.
+    It is NOT required for -Run or -Scheduled; leave it off for hands-off operation.
 
-References:
-- Remove-ADUser: https://learn.microsoft.com/powershell/module/activedirectory/remove-aduser
-- Get-ADUser: https://learn.microsoft.com/powershell/module/activedirectory/get-aduser
-- userAccountControl flags (ACCOUNTDISABLE): https://learn.microsoft.com/troubleshoot/windows-server/active-directory/useraccountcontrol-manipulate-account-properties
-- whenChanged definition (not replicated): https://learn.microsoft.com/openspecs/windows_protocols/ms-adls/ac3586ae-bf24-42f2-ad23-22bdfaf75b62
+Scope: with no OUs configured the script runs forest-wide (every domain). Set
+UserLimitToOUs to narrow it. All defaults can live in
+config\AD-Automation.settings.psd1 (section 'DeleteDisabledUsers' / 'Common').
 
-.USAGE
-  # Dry-run (no changes): generate CSV + log + approval draft
-  .\Invoke-ADHygieneDeleteDisabledUsers.ps1 -DryRun
+.EXAMPLE
+.\Invoke-ADHygieneDeleteDisabledUsers.ps1 -DryRun
 
-  # Dry-run + email approval package (CSV + draft + log)
-  .\Invoke-ADHygieneDeleteDisabledUsers.ps1 -DryRun -EmailApprovalList
+.EXAMPLE
+# Hands-off: delete users disabled > 180 days, max 25 per run, no list to curate.
+.\Invoke-ADHygieneDeleteDisabledUsers.ps1 -Scheduled
 
-  # Execute deletes WITHOUT approval gating (not recommended)
-  .\Invoke-ADHygieneDeleteDisabledUsers.ps1 -Run
-
-  # Execute deletes WITH approval gating (recommended)
-  .\Invoke-ADHygieneDeleteDisabledUsers.ps1 -Run -RequireApprovalList -ApprovalListPath C:\Temp\AD-Hygiene\AD-Hygiene-Delete-ApprovalList.txt
-
-  # Limit scope to specific OUs (if none specified, it runs forest-wide)
-  .\Invoke-ADHygieneDeleteDisabledUsers.ps1 -DryRun -UserLimitToOUs "OU=Disabled Users,DC=contoso,DC=local"
-
-  # Scheduled mode (recommended only with approval gating)
-  .\Invoke-ADHygieneDeleteDisabledUsers.ps1 -Scheduled -RequireApprovalList
+.NOTES
+- "Disabled since" is derived from replication metadata on userAccountControl
+  (time of the LAST UAC change, not strictly the disable event). The whenChanged
+  fallback is unreliable and only used as a last resort (logged as a WARN).
+- Requires the ActiveDirectory module and the ADAutomation module.
+- Output folder holds account data; it is created with a restricted ACL.
 #>
 
-[CmdletBinding(DefaultParameterSetName='DryRun')]
+[CmdletBinding(DefaultParameterSetName = 'DryRun')]
 param(
-  # ===== Mode switches (mutually exclusive) =====
-  [Parameter(ParameterSetName='DryRun', Mandatory=$true)]
-  [switch]$DryRun,
+    [Parameter(ParameterSetName = 'DryRun', Mandatory = $true)][switch]$DryRun,
+    [Parameter(ParameterSetName = 'Run', Mandatory = $true)][switch]$Run,
+    [Parameter(ParameterSetName = 'Scheduled', Mandatory = $true)][switch]$Scheduled,
 
-  [Parameter(ParameterSetName='Run', Mandatory=$true)]
-  [switch]$Run,
+    # OPTIONAL manual change-control. Not required for -Run or -Scheduled.
+    [Parameter(ParameterSetName = 'Run')]
+    [Parameter(ParameterSetName = 'Scheduled')]
+    [switch]$RequireApprovalList,
 
-  [Parameter(ParameterSetName='Scheduled', Mandatory=$true)]
-  [switch]$Scheduled,
+    [Parameter(ParameterSetName = 'DryRun')]
+    [switch]$EmailApprovalList,
 
-  # ===== Safety gate (recommended for Run/Scheduled) =====
-  [Parameter(ParameterSetName='Run')]
-  [Parameter(ParameterSetName='Scheduled')]
-  [switch]$RequireApprovalList,
-
-  # ===== Email approval package (DryRun only) =====
-  [Parameter(ParameterSetName='DryRun')]
-  [switch]$EmailApprovalList,
-
-  # ===== SMTP relay (no auth) variables =====
-  [string]$SmtpServer = "smtp-relay.contoso.local",
-  [int]$SmtpPort = 25,
-  [string]$MailFrom = "ad-hygiene@contoso.local",
-  [string[]]$MailTo = @("it-operations@contoso.local"),
-  [string]$MailSubject = "AD Hygiene – Approval list required (delete disabled users)",
-  [string]$MailBody = @"
+    [string]$SmtpServer = 'smtp-relay.contoso.local',
+    [int]$SmtpPort = 25,
+    [string]$MailFrom = 'ad-automation@contoso.local',
+    [string[]]$MailTo = @('it-operations@contoso.local'),
+    [string]$MailSubject = 'AD Hygiene - Approval list (delete disabled users)',
+    [string]$MailBody = @"
 Hej,
 
-Bifogat finns:
-1) CSV-rapport över kandidater och beslut (Eligible/Reason)
-2) Approval list (TXT) – en rad per objekt (SAMAccountName eller DistinguishedName)
-3) Logg (TXT)
-
-Granska och godkänn genom att lägga in önskade objekt i approval-listan enligt er process,
-och kör sedan scriptet med -Run -RequireApprovalList.
+Bifogat finns CSV-rapport, approval-lista (TXT) och logg over kandidater for
+borttagning. Granska, godkann i approval-listan och kor sedan scriptet med
+-Run -RequireApprovalList (eller -Scheduled -RequireApprovalList).
 
 Mvh
 AD Hygiene
 "@,
-  [bool]$MailUseSsl = $false,
+    [bool]$MailUseSsl = $false,
+    [string]$MailCredentialPath = '',
 
-  # ===== Output paths =====
-  [string]$OutputRoot = "C:\Temp\AD-Hygiene",
-  [string]$ApprovalListPath = "C:\Temp\AD-Hygiene\AD-Hygiene-Delete-ApprovalList.txt",
+    [string]$OutputRoot = 'C:\ProgramData\AD-Automation',
+    [string]$ApprovalListPath = 'C:\ProgramData\AD-Automation\DeleteDisabled-ApprovalList.txt',
 
-  # ===== Scope config =====
-  [ValidateSet('yes','no')]
-  [string]$RunInChildOU = 'yes',
+    [ValidateSet('yes', 'no')][string]$RunInChildOU = 'yes',
 
-  # If provided -> only search these OUs. If empty -> forest-wide across all domains.
-  [string[]]$UserLimitToOUs = @(),
+    # Empty = forest-wide.
+    [string[]]$UserLimitToOUs = @(),
 
-  # ===== Policy =====
-  [int]$DisabledForDays = 180,
+    [ValidateRange(1, 36500)][int]$DisabledForDays = 180,
 
-  # ===== Disable date source (recommended: ReplicationMetadata) =====
-  [ValidateSet('ReplicationMetadata','WhenChanged','StampAttribute')]
-  [string]$DisableDateSource = 'ReplicationMetadata',
+    [ValidateSet('ReplicationMetadata', 'WhenChanged', 'StampAttribute')]
+    [string]$DisableDateSource = 'ReplicationMetadata',
+    [string]$DisableStampAttributeName = 'extensionAttribute15',
 
-  # Used only when DisableDateSource=StampAttribute
-  [string]$DisableStampAttributeName = "extensionAttribute15",
-  # Expected formats: ISO 8601 date/time or yyyy-MM-dd (e.g., 2025-01-31 or 2025-01-31T10:15:00Z)
-  # Example value you might stamp: "2025-01-31T10:15:00Z"
-  [string]$DisableStampParseHint = "ISO8601",
+    [string[]]$IgnoreAccountsExact = @('Administrator', 'Guest', 'krbtgt', 'DefaultAccount', 'WDAGUtilityAccount'),
+    [string[]]$IgnoreAccountsRegex = @('^AZURE', '^MSOL', '^BTG', '^DWM-'),
 
-  # ===== Ignore accounts (exact + regex) =====
-  [string[]]$IgnoreAccountsExact = @(
-    "Administrator",
-    "Guest",
-    "krbtgt",
-    "DefaultAccount",
-    "WDAGUtilityAccount"
-  ),
-  [string[]]$IgnoreAccountsRegex = @(
-    '^AZURE', # Azure AD Connect accounts
-    '^MSOL', # MSOL accounts
-    '^BTG', # Breake The Glass accounts
-    '^DWM-' # Dynamic Windows Machine accounts
-  ),
+    # Max delete ACTIONS per run; pass -Unlimited to disable the cap.
+    [int]$MaxDeletes = 25,
+    [switch]$Unlimited,
 
-  # ===== Operational toggles =====
-  # Extra safety: max number of delete ACTIONS per run (Run/Scheduled only).
-  [int]$MaxDeletes = 0  # 0 = unlimited
+    [string]$ConfigPath = ''
 )
 
-# MODE FLAGS =======
+# --- Bootstrap --------------------------------------------------------------
+$modulePath = Join-Path $PSScriptRoot 'ADAutomation.psd1'
+if (-not (Test-Path -LiteralPath $modulePath)) { throw "Required module not found next to script: $modulePath" }
+Import-Module $modulePath -Force -ErrorAction Stop
 
-$WhatIf = $true
-$IsScheduled = $false
-switch ($PSCmdlet.ParameterSetName) {
-  'DryRun'     { $WhatIf = $true;  $IsScheduled = $false }
-  'Run'        { $WhatIf = $false; $IsScheduled = $false }
-  'Scheduled'  { $WhatIf = $false; $IsScheduled = $true  }
+$cfg = Import-ADAutomationConfig -Path $ConfigPath -Section 'DeleteDisabledUsers'
+$boundKeys = @($PSBoundParameters.Keys)
+foreach ($k in @($cfg.Keys)) {
+    if ($k -eq '__ConfigFile') { continue }
+    if ($boundKeys -notcontains $k -and (Get-Variable -Name $k -Scope 0 -ErrorAction SilentlyContinue)) {
+        Set-Variable -Name $k -Value $cfg[$k] -Scope 0
+    }
 }
 
-# In DryRun, approval gating is irrelevant.
+if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
+    throw 'ActiveDirectory module not found. Install RSAT / AD PowerShell module.'
+}
+Import-Module ActiveDirectory -ErrorAction Stop
+
+# --- Mode flags + guardrails ------------------------------------------------
+$WhatIf = $true; $IsScheduled = $false
+switch ($PSCmdlet.ParameterSetName) {
+    'DryRun' { $WhatIf = $true; $IsScheduled = $false }
+    'Run' { $WhatIf = $false; $IsScheduled = $false }
+    'Scheduled' { $WhatIf = $false; $IsScheduled = $true }
+}
 if ($DryRun) { $RequireApprovalList = $false }
 
-# FUNCTIONS =======
-
-function Write-Log {
-  param(
-    [Parameter(Mandatory=$true)][string]$Message,
-    [ValidateSet('INFO','WARN','ERROR','ACTION','WHATIF','SKIP')][string]$Level = 'INFO'
-  )
-  $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-  $line = "[$ts][$Level] $Message"
-  Write-Output $line
-  Add-Content -Path $script:LogPath -Value $line
-}
-
-function Get-SearchScope {
-  param([string]$RunInChildOU)
-  if ($RunInChildOU -eq 'yes') { return 'Subtree' }
-  return 'OneLevel'
-}
-
-function Test-IsIgnoredSam {
-  param(
-    [Parameter(Mandatory=$true)][string]$SamAccountName,
-    [string[]]$ExactList,
-    [string[]]$RegexList
-  )
-  if ($ExactList -and ($ExactList -contains $SamAccountName)) { return $true }
-  if ($RegexList) {
-    foreach ($pattern in $RegexList) {
-      if ([string]::IsNullOrWhiteSpace($pattern)) { continue }
-      if ($SamAccountName -match $pattern) { return $true }
+# --- Helpers ----------------------------------------------------------------
+function Import-ApprovalList {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-ADAutomationLog "Approval list not found at '$Path'. With -RequireApprovalList, NO deletes are allowed." 'WARN'
+        return @()
     }
-  }
-  return $false
-}
-
-function Load-ApprovalList {
-  param([string]$Path)
-
-  if (-not (Test-Path $Path)) {
-    Write-Log "Approval list not found at '$Path'. With -RequireApprovalList, NO deletes will be allowed." 'WARN'
-    return @()
-  }
-
-  $lines = Get-Content -Path $Path -ErrorAction Stop |
-    ForEach-Object { $_.Trim([char]0xFEFF).Trim() } |
-    Where-Object { $_ -and -not $_.StartsWith('#') }
-
-  $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-  foreach ($l in $lines) { [void]$set.Add($l) }
-  return $set.ToArray()
+    $lines = Get-Content -LiteralPath $Path -ErrorAction Stop |
+        ForEach-Object { $_.Trim([char]0xFEFF).Trim() } |
+        Where-Object { $_ -and -not $_.StartsWith('#') }
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($l in $lines) { [void]$set.Add($l) }
+    return , @($set)
 }
 
 function Test-IsApproved {
-  param(
-    [Parameter(Mandatory=$true)][string]$SamAccountName,
-    [Parameter(Mandatory=$true)][string]$DistinguishedName,
-    [string[]]$ApprovalEntries
-  )
-  if (-not $ApprovalEntries -or $ApprovalEntries.Count -eq 0) { return $false }
-
-  foreach ($e in $ApprovalEntries) {
-    if ($e.Equals($SamAccountName, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-    if ($e.Equals($DistinguishedName, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
-  }
-  return $false
-}
-
-function Get-ParentOUFromDN {
-  param([Parameter(Mandatory=$true)][string]$DistinguishedName)
-  return ($DistinguishedName -replace '^[^,]+,', '')
+    param([string]$SamAccountName, [string]$DistinguishedName, [string[]]$ApprovalEntries)
+    if (-not $ApprovalEntries -or $ApprovalEntries.Count -eq 0) { return $false }
+    foreach ($e in $ApprovalEntries) {
+        if ($e.Equals($SamAccountName, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($e.Equals($DistinguishedName, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    return $false
 }
 
 function Write-ApprovalListDraft {
-  param(
-    [Parameter(Mandatory=$true)]$ReportRows,
-    [Parameter(Mandatory=$true)][string]$Path
-  )
-
-  $eligible = $ReportRows | Where-Object { $_.Eligible -eq $true }
-
-  $lines = @(
-    "# AD Hygiene Approval List (DELETE disabled users)",
-    "# One entry per line: SAMAccountName or DistinguishedName",
-    "# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
-    "# Tip: keep only the objects you approve for deletion in the next Run.",
-    ""
-  )
-
-  $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-  foreach ($r in $eligible) { [void]$set.Add($r.SamAccountName) }
-
-  $lines += ($set.ToArray() | Sort-Object)
-  $lines | Set-Content -Path $Path -Encoding UTF8
-
-  Write-Log "Approval list draft written: $Path (eligible unique count=$($set.Count))" 'INFO'
+    param($ReportRows, [string]$Path)
+    $eligible = $ReportRows | Where-Object { $_.Eligible -eq $true }
+    $lines = @(
+        '# AD Hygiene Approval List (DELETE disabled users)',
+        '# One entry per line: SAMAccountName or DistinguishedName',
+        "# Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
+        '# Keep only the objects you approve for deletion in the next Run.',
+        ''
+    )
+    $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in $eligible) { [void]$set.Add($r.SamAccountName) }
+    $lines += (@($set) | Sort-Object)
+    $lines | Set-Content -LiteralPath $Path -Encoding UTF8
+    Write-ADAutomationLog "Approval list draft written: $Path (eligible unique count=$($set.Count))" 'INFO'
 }
 
-function Send-ApprovalEmail {
-  param(
-    [Parameter(Mandatory=$true)][string]$SmtpServer,
-    [Parameter(Mandatory=$true)][int]$SmtpPort,
-    [Parameter(Mandatory=$true)][string]$From,
-    [Parameter(Mandatory=$true)][string[]]$To,
-    [Parameter(Mandatory=$true)][string]$Subject,
-    [Parameter(Mandatory=$true)][string]$Body,
-    [Parameter(Mandatory=$true)][string[]]$Attachments,
-    [bool]$UseSsl = $false
-  )
-
-  foreach ($a in $Attachments) {
-    if (-not (Test-Path $a)) { throw "Attachment not found: $a" }
-  }
-
-  try {
-    Send-MailMessage `
-      -SmtpServer $SmtpServer `
-      -Port $SmtpPort `
-      -From $From `
-      -To $To `
-      -Subject $Subject `
-      -Body $Body `
-      -BodyAsHtml:$false `
-      -Attachments $Attachments `
-      -UseSsl:$UseSsl `
-      -ErrorAction Stop
-
-    Write-Log "Email sent to '$($To -join ',')' via $SmtpServer:$SmtpPort (SSL=$UseSsl). Attachments: $($Attachments -join ';')" 'ACTION'
-  } catch {
-    Write-Log "ERROR sending email: $($_.Exception.Message)" 'ERROR'
-    throw
-  }
-}
-
-function Try-Parse-Date {
-  param([string]$Value)
-
-  if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-  $v = $Value.Trim()
-
-  $dt = $null
-  # Try invariant parse first
-  if ([DateTime]::TryParse($v, [System.Globalization.CultureInfo]::InvariantCulture,
-      [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)) {
-    return $dt.ToUniversalTime()
-  }
-
-  # Try yyyy-MM-dd
-  if ([DateTime]::TryParseExact($v, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture,
-      [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)) {
-    return $dt.ToUniversalTime()
-  }
-
-  return $null
+function ConvertTo-DateTimeOrNull {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $v = $Value.Trim(); $dt = [datetime]::MinValue
+    if ([DateTime]::TryParse($v, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)) { return $dt.ToUniversalTime() }
+    if ([DateTime]::TryParseExact($v, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dt)) { return $dt.ToUniversalTime() }
+    return $null
 }
 
 function Get-DisableDate {
-  param(
-    [Parameter(Mandatory=$true)][string]$DistinguishedName,
-    [Parameter(Mandatory=$true)]$AdUser,
-    [Parameter(Mandatory=$true)][string]$Source,
-    [Parameter(Mandatory=$true)][string]$Server,
-    [string]$StampAttributeName
-  )
-
-  switch ($Source) {
-    'StampAttribute' {
-      if ([string]::IsNullOrWhiteSpace($StampAttributeName)) { return $null }
-      $val = $AdUser.$StampAttributeName
-      if (-not $val) { return $null }
-      return (Try-Parse-Date -Value $val.ToString())
-    }
-
-    'ReplicationMetadata' {
-      try {
-        # Replication attribute metadata provides originating change time for replicated attributes
-        $meta = Get-ADReplicationAttributeMetadata -Object $DistinguishedName -Server $Server -ErrorAction Stop |
-          Where-Object { $_.AttributeName -eq 'userAccountControl' } |
-          Select-Object -First 1
-
-        if ($meta -and $meta.LastOriginatingChangeTime) {
-          return ($meta.LastOriginatingChangeTime.ToUniversalTime())
+    param([string]$DistinguishedName, $AdUser, [string]$Source, [string]$Server, [string]$StampAttributeName)
+    switch ($Source) {
+        'StampAttribute' {
+            if ([string]::IsNullOrWhiteSpace($StampAttributeName)) { return $null }
+            $val = $AdUser.$StampAttributeName
+            if (-not $val) { return $null }
+            return (ConvertTo-DateTimeOrNull -Value $val.ToString())
         }
-      } catch {
-        # Fall through to null; caller can decide fallback
-        Write-Log "WARN: ReplicationMetadata failed for DN='$DistinguishedName' on Server='$Server' : $($_.Exception.Message)" 'WARN'
-      }
-      return $null
+        'ReplicationMetadata' {
+            try {
+                $meta = Get-ADReplicationAttributeMetadata -Object $DistinguishedName -Server $Server -ErrorAction Stop |
+                    Where-Object { $_.AttributeName -eq 'userAccountControl' } | Select-Object -First 1
+                if ($meta -and $meta.LastOriginatingChangeTime) { return ($meta.LastOriginatingChangeTime.ToUniversalTime()) }
+            }
+            catch { Write-ADAutomationLog "ReplicationMetadata failed for '$DistinguishedName' on '$Server': $($_.Exception.Message)" 'WARN' }
+            return $null
+        }
+        'WhenChanged' {
+            if ($AdUser.whenChanged) { return ($AdUser.whenChanged.ToUniversalTime()) }
+            return $null
+        }
     }
-
-    'WhenChanged' {
-      if ($AdUser.whenChanged) { return ($AdUser.whenChanged.ToUniversalTime()) }
-      return $null
-    }
-  }
-
-  return $null
+    return $null
 }
 
-# MAIN SETUP =======
+# --- Setup ------------------------------------------------------------------
+$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName 'ADHygiene-DeleteDisabledUsers'
+$CsvReportPath = Join-Path $OutputRoot ("ADHygiene-DeleteDisabledUsers-Report-{0}.csv" -f $run.RunId)
+$ApprovalDraftPath = Join-Path $OutputRoot ("ADHygiene-Delete-ApprovalList-Draft-{0}.txt" -f $run.RunId)
 
-if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
-  throw "ActiveDirectory module not found. Install RSAT / AD PowerShell module."
+$mailCommon = @{
+    From = $MailFrom; SmtpServer = $SmtpServer; SmtpPort = $SmtpPort
+    UseSsl = $MailUseSsl; CredentialPath = $MailCredentialPath
 }
-Import-Module ActiveDirectory
 
-New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
-
-$RunId = Get-Date -Format 'yyyyMMdd-HHmmss'
-$script:LogPath = Join-Path $OutputRoot "ADHygiene-DeleteDisabledUsers-$RunId.log"
-$CsvReportPath  = Join-Path $OutputRoot "ADHygiene-DeleteDisabledUsers-Report-$RunId.csv"
-$ApprovalDraftPath = Join-Path $OutputRoot "ADHygiene-Delete-ApprovalList-Draft-$RunId.txt"
-
-New-Item -ItemType File -Force -Path $script:LogPath | Out-Null
-
-$scope = Get-SearchScope -RunInChildOU $RunInChildOU
+$scope = if ($RunInChildOU -eq 'yes') { 'Subtree' } else { 'OneLevel' }
 $cutoff = (Get-Date).ToUniversalTime().AddDays(-$DisabledForDays)
 
-# Approval list
 $approvalEntries = @()
-if ($RequireApprovalList) {
-  $approvalEntries = Load-ApprovalList -Path $ApprovalListPath
-}
+if ($RequireApprovalList) { $approvalEntries = Import-ApprovalList -Path $ApprovalListPath }
 
-Write-Log "=== START (RunId=$RunId) ==="
-Write-Log "Mode=$($PSCmdlet.ParameterSetName) ; WhatIf=$WhatIf ; Scheduled=$IsScheduled ; RequireApprovalList=$RequireApprovalList ; MaxDeletes=$MaxDeletes"
-Write-Log "OutputRoot=$OutputRoot"
-Write-Log "Log=$script:LogPath"
-Write-Log "CSV=$CsvReportPath"
-Write-Log "ApprovalListPath=$ApprovalListPath"
-Write-Log "SearchScope=$scope"
-Write-Log "Policy: DisabledForDays=$DisabledForDays ; Cutoff(UTC)=$cutoff"
-Write-Log "DisableDateSource=$DisableDateSource ; StampAttribute=$DisableStampAttributeName"
-Write-Log "IgnoreExact=$($IgnoreAccountsExact -join ',')" 'INFO'
-Write-Log "IgnoreRegex=$($IgnoreAccountsRegex | Where-Object { $_ } -join ',')" 'INFO'
+Write-ADAutomationLog "=== START (RunId=$($run.RunId)) ==="
+Write-ADAutomationLog ("Mode={0} ; WhatIf={1} ; Scheduled={2} ; RequireApprovalList={3} ; MaxDeletes={4} ; Unlimited={5}" -f `
+        $PSCmdlet.ParameterSetName, $WhatIf, $IsScheduled, $RequireApprovalList, $MaxDeletes, [bool]$Unlimited)
+Write-ADAutomationLog ("Policy: DisabledForDays={0} ; Cutoff(UTC)={1} ; DisableDateSource={2}" -f $DisabledForDays, $cutoff, $DisableDateSource)
+Write-ADAutomationLog ("IgnoreExact={0} ; IgnoreRegex={1}" -f ($IgnoreAccountsExact -join ','), (@($IgnoreAccountsRegex | Where-Object { $_ }) -join ','))
 
 $report = New-Object System.Collections.Generic.List[object]
 $script:DeleteCount = 0
-
-function Add-DeleteCount { param([int]$Delta = 1) $script:DeleteCount += $Delta }
 function Test-CanDelete {
-  if ($WhatIf) { return $true }
-  if ($MaxDeletes -le 0) { return $true }
-  return ($script:DeleteCount -lt $MaxDeletes)
+    if ($WhatIf) { return $true }
+    if ($Unlimited) { return $true }
+    return ($script:DeleteCount -lt $MaxDeletes)
 }
 
-# Determine search targets:
-# - If UserLimitToOUs is non-empty -> use those OUs (validated lightly by trying queries)
-# - Else -> forest-wide: iterate domains, SearchBase = domain DN
+# Build targets: explicit OUs, else forest-wide (each domain root, pinned to PDCe).
 $targets = New-Object System.Collections.Generic.List[object]
-
-if ($UserLimitToOUs -and ($UserLimitToOUs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
-  foreach ($ou in $UserLimitToOUs) {
-    if ([string]::IsNullOrWhiteSpace($ou)) { continue }
-
-    # Determine domain fqdn from DN DC components
-    $dcs = ([regex]::Matches($ou, 'DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value })
-    $domainFqdn = ($dcs -join '.')
-    if ([string]::IsNullOrWhiteSpace($domainFqdn)) {
-      Write-Log "Search base OU does not contain DC components (skipping): $ou" 'WARN'
-      continue
+if ($UserLimitToOUs -and @($UserLimitToOUs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+    foreach ($ou in $UserLimitToOUs) {
+        if ([string]::IsNullOrWhiteSpace($ou)) { continue }
+        $dcs = [regex]::Matches($ou, 'DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value }
+        $domainFqdn = ($dcs -join '.')
+        if ([string]::IsNullOrWhiteSpace($domainFqdn)) { Write-ADAutomationLog "OU has no DC components (skipping): $ou" 'WARN'; continue }
+        $server = $domainFqdn
+        try { $server = (Get-ADDomain -Server $domainFqdn -ErrorAction Stop).PDCEmulator } catch { Write-ADAutomationLog "Could not resolve PDCEmulator for '$domainFqdn' (using DNS): $($_.Exception.Message)" 'WARN' }
+        $targets.Add([pscustomobject]@{ Domain = $domainFqdn; Server = $server; SearchBase = $ou; Scope = $scope; Mode = 'OU' }) | Out-Null
     }
-
-    # Choose a DC: PDC emulator (stable) when possible
-    $server = $null
-    try {
-      $server = (Get-ADDomain -Server $domainFqdn -ErrorAction Stop).PDCEmulator
-    } catch {
-      $server = $domainFqdn
-      Write-Log "WARN: Could not resolve PDCEmulator for domain '$domainFqdn' (using domain DNS instead). Error: $($_.Exception.Message)" 'WARN'
-    }
-
-    $targets.Add([pscustomobject]@{
-      Domain   = $domainFqdn
-      Server   = $server
-      SearchBase = $ou
-      Scope    = $scope
-      Mode     = 'OU'
-    }) | Out-Null
-  }
-} else {
-  try {
-    $forest = Get-ADForest -ErrorAction Stop
-  } catch {
-    throw "Failed to get forest info: $($_.Exception.Message)"
-  }
-
-  foreach ($domainFqdn in $forest.Domains) {
-    $server = $null
-    $domainDn = $null
-    try {
-      $d = Get-ADDomain -Server $domainFqdn -ErrorAction Stop
-      $server = $d.PDCEmulator
-      $domainDn = $d.DistinguishedName
-    } catch {
-      Write-Log "WARN: Failed to resolve domain DN/PDC for '$domainFqdn' (using domain DNS as server and skipping DN lookup). Error: $($_.Exception.Message)" 'WARN'
-      $server = $domainFqdn
-      try {
-        $domainDn = (Get-ADDomain -Server $server -ErrorAction Stop).DistinguishedName
-      } catch {
-        Write-Log "ERROR: Cannot determine domain DN for '$domainFqdn' (skipping domain). Error: $($_.Exception.Message)" 'ERROR'
-        continue
-      }
-    }
-
-    $targets.Add([pscustomobject]@{
-      Domain   = $domainFqdn
-      Server   = $server
-      SearchBase = $domainDn
-      Scope    = 'Subtree'
-      Mode     = 'Domain'
-    }) | Out-Null
-  }
 }
-
-Write-Log "Targets count=$($targets.Count). Target list: $(( $targets | ForEach-Object { "$($_.Mode):$($_.SearchBase)@$($_.Server)" } ) -join ' ; ' )" 'INFO'
-
-function Process-Target {
-  param([Parameter(Mandatory=$true)]$Target)
-
-  Write-Log "--- USERS: Processing Target: Mode=$($Target.Mode) Domain=$($Target.Domain) Server=$($Target.Server) Base=$($Target.SearchBase) Scope=$($Target.Scope) ---"
-
-  $props = @('SamAccountName','DistinguishedName','Enabled','whenChanged','isCriticalSystemObject')
-  if ($DisableDateSource -eq 'StampAttribute' -and -not [string]::IsNullOrWhiteSpace($DisableStampAttributeName)) {
-    $props += $DisableStampAttributeName
-  }
-
-  # Disabled accounts: userAccountControl bitwise match on ACCOUNTDISABLE (2)
-  # Also avoid critical system objects defensively.
-  $ldap = "(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=2)(!(isCriticalSystemObject=TRUE)))"
-
-  $users = @()
-  try {
-    $users = Get-ADUser -Server $Target.Server -SearchBase $Target.SearchBase -SearchScope $Target.Scope `
-      -LDAPFilter $ldap -Properties $props -ErrorAction Stop
-  } catch {
-    Write-Log "USERS ERROR querying base '$($Target.SearchBase)' on '$($Target.Server)': $($_.Exception.Message)" 'ERROR'
-    return
-  }
-
-  foreach ($u in $users) {
-    $sam = $u.SamAccountName
-    $dn  = $u.DistinguishedName
-    $ouPath = Get-ParentOUFromDN -DistinguishedName $dn
-
-    if (Test-IsIgnoredSam -SamAccountName $sam -ExactList $IgnoreAccountsExact -RegexList $IgnoreAccountsRegex) {
-      Write-Log "USERS SKIP (ignored): $sam" 'SKIP'
-      $report.Add([pscustomobject]@{
-        Domain=$Target.Domain; Server=$Target.Server; SearchBase=$Target.SearchBase
-        SamAccountName=$sam; DistinguishedName=$dn; OU=$ouPath
-        Enabled=$u.Enabled; WhenChanged=$u.whenChanged
-        DisableDate=$null; DaysDisabled=$null
-        Eligible=$false; Approved=$null
-        Action='None'; Result='Skipped'
-        Reason='Ignored by exact/regex'
-      }) | Out-Null
-      continue
+else {
+    try { $forest = Get-ADForest -ErrorAction Stop } catch { throw "Failed to get forest info: $($_.Exception.Message)" }
+    foreach ($domainFqdn in $forest.Domains) {
+        $server = $domainFqdn; $domainDn = $null
+        try { $d = Get-ADDomain -Server $domainFqdn -ErrorAction Stop; $server = $d.PDCEmulator; $domainDn = $d.DistinguishedName }
+        catch {
+            Write-ADAutomationLog "Failed to resolve '$domainFqdn' (trying DNS): $($_.Exception.Message)" 'WARN'
+            try { $domainDn = (Get-ADDomain -Server $server -ErrorAction Stop).DistinguishedName } catch { Write-ADAutomationLog "Cannot determine DN for '$domainFqdn' (skipping)." 'ERROR'; continue }
+        }
+        $targets.Add([pscustomobject]@{ Domain = $domainFqdn; Server = $server; SearchBase = $domainDn; Scope = 'Subtree'; Mode = 'Domain' }) | Out-Null
     }
+}
+Write-ADAutomationLog ("Targets: {0}" -f (($targets | ForEach-Object { "$($_.Mode):$($_.SearchBase)@$($_.Server)" }) -join ' ; '))
 
-    # Determine disable date by configured source; optionally fallback to WhenChanged if ReplicationMetadata fails.
-    $disableDate = Get-DisableDate -DistinguishedName $dn -AdUser $u -Source $DisableDateSource -Server $Target.Server -StampAttributeName $DisableStampAttributeName
-
-    $usedSource = $DisableDateSource
-    if (-not $disableDate -and $DisableDateSource -eq 'ReplicationMetadata') {
-      # safe fallback: WhenChanged (note: not perfect)
-      $disableDate = Get-DisableDate -DistinguishedName $dn -AdUser $u -Source 'WhenChanged' -Server $Target.Server -StampAttributeName $DisableStampAttributeName
-      $usedSource = if ($disableDate) { 'WhenChanged(Fallback)' } else { 'Unknown' }
-    }
-
-    $eligible = $false
-    $reason = $null
-    $daysDisabled = $null
-
-    if (-not $disableDate) {
-      $reason = "Cannot determine disable date (Source=$usedSource). Not eligible."
-    } else {
-      $daysDisabled = [int][Math]::Floor(((Get-Date).ToUniversalTime() - $disableDate).TotalDays)
-      if ($disableDate -lt $cutoff) {
-        $eligible = $true
-        $reason = "DisabledDate(UTC)=$disableDate (Source=$usedSource) older than cutoff(UTC)=$cutoff (DaysDisabled=$daysDisabled)"
-      } else {
-        $reason = "DisabledDate(UTC)=$disableDate (Source=$usedSource) newer than cutoff(UTC)=$cutoff (DaysDisabled=$daysDisabled)"
-      }
-    }
-
-    $approved = $null
-    if ($RequireApprovalList) {
-      $approved = Test-IsApproved -SamAccountName $sam -DistinguishedName $dn -ApprovalEntries $approvalEntries
-    }
-
-    $row = [pscustomobject]@{
-      Domain=$Target.Domain; Server=$Target.Server; SearchBase=$Target.SearchBase
-      SamAccountName=$sam; DistinguishedName=$dn; OU=$ouPath
-      Enabled=$u.Enabled; WhenChanged=$u.whenChanged
-      DisableDate=$disableDate; DaysDisabled=$daysDisabled
-      Eligible=$eligible; Approved=$approved
-      Action='Remove-ADUser'; Result='None'
-      Reason=$reason
-    }
-
-    if (-not $eligible) {
-      $row.Result='NoChange'
-      $report.Add($row) | Out-Null
-      continue
-    }
-
-    if ($WhatIf) {
-      Write-Log "USERS WHATIF candidate: $sam ; WouldDelete ; $reason" 'WHATIF'
-      $row.Result='WhatIf'
-      $report.Add($row) | Out-Null
-      continue
-    }
-
-    if ($RequireApprovalList -and -not $approved) {
-      Write-Log "USERS SKIP (not approved): $sam ; would delete" 'SKIP'
-      $row.Result='NotApproved'
-      $report.Add($row) | Out-Null
-      continue
-    }
-
-    if (-not (Test-CanDelete)) {
-      Write-Log "USERS SKIP (MaxDeletes reached=$MaxDeletes): $sam ; would delete" 'SKIP'
-      $row.Result='MaxDeletesReached'
-      $report.Add($row) | Out-Null
-      continue
-    }
+function Invoke-TargetProcessing {
+    param($Target)
+    Write-ADAutomationLog "--- Target: Mode=$($Target.Mode) Domain=$($Target.Domain) Server=$($Target.Server) Base=$($Target.SearchBase) ---"
+    $props = @('SamAccountName', 'DistinguishedName', 'Enabled', 'whenChanged', 'isCriticalSystemObject')
+    if ($DisableDateSource -eq 'StampAttribute' -and -not [string]::IsNullOrWhiteSpace($DisableStampAttributeName)) { $props += $DisableStampAttributeName }
+    $ldap = '(&(objectCategory=person)(objectClass=user)(userAccountControl:1.2.840.113556.1.4.803:=2)(!(isCriticalSystemObject=TRUE)))'
 
     try {
-      Remove-ADUser -Identity $dn -Server $Target.Server -Confirm:$false -ErrorAction Stop
-      Write-Log "USERS ACTION: Deleted: $sam (DN=$dn)" 'ACTION'
-      Add-DeleteCount -Delta 1
-      $row.Result='Deleted'
-    } catch {
-      Write-Log "USERS ERROR: Delete failed for $sam (DN=$dn): $($_.Exception.Message)" 'ERROR'
-      $row.Result='Error'
+        $users = Get-ADUser -Server $Target.Server -SearchBase $Target.SearchBase -SearchScope $Target.Scope -LDAPFilter $ldap -Properties $props -ErrorAction Stop
     }
+    catch { Write-ADAutomationLog "ERROR querying '$($Target.SearchBase)' on '$($Target.Server)': $($_.Exception.Message)" 'ERROR'; return }
 
-    $report.Add($row) | Out-Null
-  }
+    foreach ($u in $users) {
+        $sam = $u.SamAccountName; $dn = $u.DistinguishedName; $ouPath = Get-ParentDN -DistinguishedName $dn
+
+        if (Test-IsIgnoredName -Name $sam -ExactList $IgnoreAccountsExact -RegexList $IgnoreAccountsRegex) {
+            Write-ADAutomationLog "SKIP (ignored): $sam" 'SKIP'
+            $report.Add([pscustomobject]@{ Domain = $Target.Domain; Server = $Target.Server; SamAccountName = $sam; DistinguishedName = $dn; OU = $ouPath; Enabled = $u.Enabled; WhenChanged = $u.whenChanged; DisableDate = $null; DaysDisabled = $null; Eligible = $false; Approved = $null; Action = 'None'; Result = 'Skipped'; Reason = 'Ignored' }) | Out-Null
+            continue
+        }
+
+        $disableDate = Get-DisableDate -DistinguishedName $dn -AdUser $u -Source $DisableDateSource -Server $Target.Server -StampAttributeName $DisableStampAttributeName
+        $usedSource = $DisableDateSource
+        if (-not $disableDate -and $DisableDateSource -eq 'ReplicationMetadata') {
+            $disableDate = Get-DisableDate -DistinguishedName $dn -AdUser $u -Source 'WhenChanged' -Server $Target.Server -StampAttributeName $DisableStampAttributeName
+            $usedSource = if ($disableDate) { 'WhenChanged(Fallback)' } else { 'Unknown' }
+            if ($disableDate) { Write-ADAutomationLog "WARN: ReplicationMetadata unavailable for $sam; using whenChanged (unreliable disable timestamp)." 'WARN' }
+        }
+
+        $eligible = $false; $reason = $null; $daysDisabled = $null
+        if (-not $disableDate) { $reason = "Cannot determine disable date (Source=$usedSource). Not eligible." }
+        else {
+            $daysDisabled = [int][Math]::Floor(((Get-Date).ToUniversalTime() - $disableDate).TotalDays)
+            if ($disableDate -lt $cutoff) { $eligible = $true; $reason = "DisableDate(UTC)=$disableDate (Source=$usedSource) < cutoff (DaysDisabled=$daysDisabled)" }
+            else { $reason = "DisableDate(UTC)=$disableDate (Source=$usedSource) >= cutoff (DaysDisabled=$daysDisabled)" }
+        }
+
+        $approved = $null
+        if ($RequireApprovalList) { $approved = Test-IsApproved -SamAccountName $sam -DistinguishedName $dn -ApprovalEntries $approvalEntries }
+
+        $row = [pscustomobject]@{ Domain = $Target.Domain; Server = $Target.Server; SamAccountName = $sam; DistinguishedName = $dn; OU = $ouPath; Enabled = $u.Enabled; WhenChanged = $u.whenChanged; DisableDate = $disableDate; DaysDisabled = $daysDisabled; Eligible = $eligible; Approved = $approved; Action = 'Remove-ADUser'; Result = 'None'; Reason = $reason }
+
+        if (-not $eligible) { $row.Result = 'NoChange'; $report.Add($row) | Out-Null; continue }
+        if ($WhatIf) { Write-ADAutomationLog "WHATIF: would delete $sam ; $reason" 'WHATIF'; $row.Result = 'WhatIf'; $report.Add($row) | Out-Null; continue }
+        if ($RequireApprovalList -and -not $approved) { Write-ADAutomationLog "SKIP (not approved): $sam" 'SKIP'; $row.Result = 'NotApproved'; $report.Add($row) | Out-Null; continue }
+        # Defence-in-depth: never delete on the unreliable whenChanged fallback.
+        if ($usedSource -eq 'WhenChanged(Fallback)') { Write-ADAutomationLog "SKIP (unreliable date source): $sam eligible by whenChanged only." 'SKIP'; $row.Result = 'SkippedUnreliableDate'; $report.Add($row) | Out-Null; continue }
+        if (-not (Test-CanDelete)) { Write-ADAutomationLog "SKIP (MaxDeletes=$MaxDeletes reached): $sam" 'SKIP'; $row.Result = 'MaxDeletesReached'; $report.Add($row) | Out-Null; continue }
+
+        try {
+            Remove-ADUser -Identity $dn -Server $Target.Server -Confirm:$false -ErrorAction Stop
+            Write-ADAutomationLog "ACTION: Deleted: $sam (DN=$dn)" 'ACTION'
+            $script:DeleteCount++
+            $row.Result = 'Deleted'
+        }
+        catch { Write-ADAutomationLog "ERROR: Delete failed for $sam : $($_.Exception.Message)" 'ERROR'; $row.Result = 'Error' }
+        $report.Add($row) | Out-Null
+    }
+}
+foreach ($t in $targets) { Invoke-TargetProcessing -Target $t }
+
+# --- Approval coverage report ----------------------------------------------
+if ($RequireApprovalList -and $approvalEntries.Count -gt 0) {
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in $report) { [void]$seen.Add($r.SamAccountName); [void]$seen.Add($r.DistinguishedName) }
+    $unmatched = @($approvalEntries | Where-Object { -not $seen.Contains($_) })
+    if ($unmatched.Count -gt 0) { Write-ADAutomationLog "Approval entries that matched NO object this run: $($unmatched -join '; ')" 'WARN' }
 }
 
-foreach ($t in $targets) { Process-Target -Target $t }
+# --- Reporting --------------------------------------------------------------
+try { $report | Export-Csv -Path $CsvReportPath -NoTypeInformation -Encoding UTF8; Write-ADAutomationLog "CSV report written: $CsvReportPath" 'INFO' }
+catch { Write-ADAutomationLog "ERROR writing CSV report: $($_.Exception.Message)" 'ERROR' }
 
-# REPORTING =======
+Write-ADAutomationLog "=== END (DeleteCount=$($script:DeleteCount)) ==="
 
-try {
-  $report | Export-Csv -Path $CsvReportPath -NoTypeInformation -Encoding UTF8
-  Write-Log "CSV report written: $CsvReportPath" 'INFO'
-} catch {
-  Write-Log "ERROR writing CSV report: $($_.Exception.Message)" 'ERROR'
-}
-
-Write-Log "=== END (DeleteCount=$script:DeleteCount) ==="
-
-# DryRun workflow: approval draft + optional email package
 if ($DryRun) {
-  try {
-    Write-ApprovalListDraft -ReportRows $report -Path $ApprovalDraftPath
-  } catch {
-    Write-Log "ERROR writing approval draft: $($_.Exception.Message)" 'ERROR'
-  }
+    try { Write-ApprovalListDraft -ReportRows $report -Path $ApprovalDraftPath }
+    catch { Write-ADAutomationLog "ERROR writing approval draft: $($_.Exception.Message)" 'ERROR' }
 
-  if ($EmailApprovalList) {
-    $attachments = @($CsvReportPath, $ApprovalDraftPath, $script:LogPath)
-    Write-Log "Preparing to send approval email via $SmtpServer:$SmtpPort (SSL=$MailUseSsl) From=$MailFrom To=$($MailTo -join ',')" 'INFO'
-    Send-ApprovalEmail -SmtpServer $SmtpServer -SmtpPort $SmtpPort -From $MailFrom -To $MailTo -Subject $MailSubject -Body $MailBody -Attachments $attachments -UseSsl:$MailUseSsl
-  }
+    if ($EmailApprovalList) {
+        if ($SmtpServer -match '(?i)contoso\.') {
+            Write-ADAutomationLog "Refusing to e-mail approval package: SmtpServer still uses the 'contoso' placeholder." 'ERROR'
+        }
+        else {
+            $attachments = @($CsvReportPath, $ApprovalDraftPath, $run.LogPath)
+            [void](Send-ADAutomationMail @mailCommon -To $MailTo -Subject $MailSubject -Body $MailBody -Attachments $attachments)
+        }
+    }
 }
 
-Write-Output "Done."
-Write-Output "Mode: $($PSCmdlet.ParameterSetName) ; RequireApprovalList=$RequireApprovalList ; DeleteCount=$script:DeleteCount"
-Write-Output "Log: $script:LogPath"
+Write-Output "Done. Mode=$($PSCmdlet.ParameterSetName) RequireApprovalList=$RequireApprovalList DeleteCount=$($script:DeleteCount)"
+Write-Output "Log: $($run.LogPath)"
 Write-Output "CSV: $CsvReportPath"
 if ($DryRun) { Write-Output "Approval draft: $ApprovalDraftPath" }
-if ($RequireApprovalList) { Write-Output "Approval list (input): $ApprovalListPath" }
