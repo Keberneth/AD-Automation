@@ -72,6 +72,8 @@
         ComputerInactiveForDays = 60
 
         MaxChanges       = 0                   # 0 = unlimited (per object)
+        # OPTIONAL: only used if you run with -RequireApprovalList (manual change-control).
+        # Hands-off operation needs NO approval list - leave -RequireApprovalList off.
         ApprovalListPath = 'C:\ProgramData\AD-Automation\DisableInactive-ApprovalList.txt'
 
         IgnoreAccountsExact = @('Administrator', 'Guest', 'krbtgt', 'DefaultAccount', 'WDAGUtilityAccount')

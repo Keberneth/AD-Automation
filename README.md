@@ -228,6 +228,14 @@ label like `8846F...586C`. Full hashes hit disk only with `-WriteHashCsv`.
 .\Install-ADAutomationScheduledTask.ps1 -UseSystem -Include PasswordExpiry,Lockout,DisableWarning
 ```
 
+Prefer to import by hand (or deploy by GPO)? Ready-made, schema-valid task XML —
+one per script, same cadence as the installer — is in
+**[scheduled-tasks/](scheduled-tasks/)**: import via Task Scheduler's
+"Import Task…", `Register-ScheduledTask -Xml`, or `schtasks /xml`. Regenerate them
+with [scheduled-tasks/Build-TaskXml.ps1](scheduled-tasks/Build-TaskXml.ps1) to
+change the run-as account, script path, or schedule. See that folder's
+[README](scheduled-tasks/README.md).
+
 Run-as options, a least-privilege gMSA, per-task manual `Register-ScheduledTask`
 examples, the recommended schedule, and **event-driven** triggers for the password
 jobs are all in **[docs/SCHEDULED-TASKS.md](docs/SCHEDULED-TASKS.md)**.

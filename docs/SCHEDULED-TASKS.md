@@ -53,6 +53,33 @@ are registered in `-DryRun`. Review their reports under
 
 ---
 
+## 1b. Import-ready XML (no installer)
+
+If you'd rather import tasks by hand — or push them out with Group Policy /
+`schtasks` — the [`scheduled-tasks/`](../scheduled-tasks/) folder has one
+ready-made `.xml` per script (`ADAuto-*.xml`), with the same triggers and
+arguments the installer uses. They're generated from the Task Scheduler API, so
+they're schema-valid and import cleanly.
+
+Defaults: run-as **SYSTEM** (simplest on a DC) and the two destructive jobs in
+**`-DryRun`**. Scripts are assumed to be in `C:\AD-Automation`.
+
+```powershell
+# Import all of them under \AD-Automation, as SYSTEM (run elevated)
+Get-ChildItem .\scheduled-tasks\ADAuto-*.xml | ForEach-Object {
+    Register-ScheduledTask -Xml (Get-Content $_.FullName -Raw) `
+        -TaskName $_.BaseName -TaskPath '\AD-Automation' -Force
+}
+```
+
+Or in the GUI: `taskschd.msc` → **Action → Import Task…**. To change the run-as
+account, the script location, or flip the destructive jobs to `-Scheduled`, re-run
+`scheduled-tasks\Build-TaskXml.ps1` (e.g. `-RunAs 'CORP\adauto$' -ScriptRoot
+'D:\AD-Automation'`) or edit the file before importing. Full details:
+[scheduled-tasks/README.md](../scheduled-tasks/README.md).
+
+---
+
 ## 2. Recommended schedule
 
 | Task | Suggested trigger | Arguments |
