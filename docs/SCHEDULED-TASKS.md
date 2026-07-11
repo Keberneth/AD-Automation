@@ -91,10 +91,13 @@ account, the script location, or flip the destructive jobs to `-Scheduled`, re-r
 | Delete disabled users | Weekly Sun 03:00 | `-Scheduled` |
 | Duplicate-password notify | Every 30 min *or* on event 4720 | `-Run` |
 | Password-change audit | Every 30 min *or* on event 4723/4724 | `-Run` |
-| Server group provisioning | Daily 04:00 | *(none)* |
+| Server group provisioning | Daily 04:00 | `-WhatIf` (preview; remove to go live) |
 
-> Make the lockout interval **>=** `-LookbackMinutes`; the script also keeps a
-> per-DC high-water mark so brief overlaps never produce duplicate e-mails.
+> Set `-LookbackMinutes` **>=** the lockout run interval (e.g. interval 15 min,
+> `-LookbackMinutes 20`) so a delayed or skipped cycle is still covered. The script
+> keeps a per-DC high-water mark so the overlap never produces duplicate e-mails,
+> catches up from the last successful run, and resets the mark if a DC's Security
+> log is cleared/recreated.
 
 ---
 
@@ -243,6 +246,12 @@ Start-ScheduledTask -TaskName 'ADAuto-PasswordExpiry' -TaskPath '\AD-Automation\
 
 # Every run also writes a timestamped log + CSV
 Get-ChildItem 'C:\ProgramData\AD-Automation' -Filter *.log | Sort-Object LastWriteTime | Select-Object -Last 5
+
+# ...and mirrors to the Windows Event Log (Applications and Services Logs >
+# AD-Automation, one event source per script; IDs: 1001 = action taken,
+# 2000 = warning, 3000 = error)
+Get-WinEvent -FilterHashtable @{ LogName = 'AD-Automation'; StartTime = (Get-Date).AddHours(-24) } |
+    Format-Table TimeCreated, ProviderName, Id, Message -AutoSize
 ```
 
 Common issues:
@@ -255,3 +264,8 @@ Common issues:
   or DSInternals isn't installed, or the task isn't running on/against a DC.
 - **Lockout job finds nothing on a multi-DC domain** – it defaults to the PDC
   emulator; set `AllDomainControllers = $true` for full coverage.
+- **Nothing appears in the AD-Automation event log** – the log/source needs one
+  elevated registration: run the installer elevated, or let the task run once as
+  SYSTEM/gMSA (it self-registers), or call
+  `Register-ADAutomationEventLog -LogName 'AD-Automation' -Sources '<script prefix>'`
+  from an elevated prompt. Until then the scripts log to console + file only.

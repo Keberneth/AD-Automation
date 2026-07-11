@@ -50,9 +50,10 @@ param(
     [ValidateSet('PasswordExpiry', 'Lockout', 'DisableWarning', 'DisableInactive', 'DeleteDisabled', 'DuplicatePassword', 'PasswordChangeAudit', 'ServerGroups')]
     [string[]]$Include,
 
-    # Override the arguments of the destructive jobs once you are ready to go live.
+    # Override the arguments of the AD-writing jobs once you are ready to go live.
     [string[]]$DisableInactiveArgs = @('-DryRun'),
     [string[]]$DeleteDisabledArgs = @('-DryRun'),
+    [string[]]$ServerGroupsArgs = @('-WhatIf'),
 
     [switch]$ListOnly
 )
@@ -74,14 +75,19 @@ if (-not $psExe) { throw 'No PowerShell host (powershell.exe / pwsh.exe) found.'
 # Each entry: Key, Script, Args, and a Trigger scriptblock returning a trigger object.
 $catalogue = @(
     [pscustomobject]@{ Key = 'PasswordExpiry'; Script = 'Invoke-ADPasswordExpiryNotify.ps1'; Args = @('-Run'); Trigger = { New-ScheduledTaskTrigger -Daily -At 7:00am } }
-    [pscustomobject]@{ Key = 'Lockout'; Script = 'Invoke-ADLockoutNotify.ps1'; Args = @('-Run', '-LookbackMinutes', '20'); Trigger = { $t = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddHours(0); $t.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration (New-TimeSpan -Days 3650)).Repetition; $t } }
+    [pscustomobject]@{ Key = 'Lockout'; Script = 'Invoke-ADLockoutNotify.ps1'; Args = @('-Run', '-LookbackMinutes', '20'); Trigger = { $t = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddHours(0); $t.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration ([TimeSpan]::MaxValue)).Repetition; $t } }
     [pscustomobject]@{ Key = 'DisableWarning'; Script = 'Invoke-ADDisableInactiveWarning.ps1'; Args = @('-Run'); Trigger = { New-ScheduledTaskTrigger -Daily -At 7:30am } }
     [pscustomobject]@{ Key = 'DisableInactive'; Script = 'Invoke-ADHygieneDisableInactive.ps1'; Args = $DisableInactiveArgs; Trigger = { New-ScheduledTaskTrigger -Daily -At 2:00am } }
     [pscustomobject]@{ Key = 'DeleteDisabled'; Script = 'Invoke-ADHygieneDeleteDisabledUsers.ps1'; Args = $DeleteDisabledArgs; Trigger = { New-ScheduledTaskTrigger -Weekly -DaysOfWeek Sunday -At 3:00am } }
-    [pscustomobject]@{ Key = 'DuplicatePassword'; Script = 'Invoke-ADDuplicatePasswordNotify.ps1'; Args = @('-Run'); Trigger = { $t = New-ScheduledTaskTrigger -Once -At (Get-Date).Date; $t.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration (New-TimeSpan -Days 3650)).Repetition; $t } }
-    [pscustomobject]@{ Key = 'PasswordChangeAudit'; Script = 'Invoke-ADPasswordChangeAudit.ps1'; Args = @('-Run'); Trigger = { $t = New-ScheduledTaskTrigger -Once -At (Get-Date).Date; $t.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration (New-TimeSpan -Days 3650)).Repetition; $t } }
-    [pscustomobject]@{ Key = 'ServerGroups'; Script = 'Invoke-ADServerGroupProvisioning.ps1'; Args = @(); Trigger = { New-ScheduledTaskTrigger -Daily -At 4:00am } }
+    [pscustomobject]@{ Key = 'DuplicatePassword'; Script = 'Invoke-ADDuplicatePasswordNotify.ps1'; Args = @('-Run'); Trigger = { $t = New-ScheduledTaskTrigger -Once -At (Get-Date).Date; $t.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration ([TimeSpan]::MaxValue)).Repetition; $t } }
+    [pscustomobject]@{ Key = 'PasswordChangeAudit'; Script = 'Invoke-ADPasswordChangeAudit.ps1'; Args = @('-Run'); Trigger = { $t = New-ScheduledTaskTrigger -Once -At (Get-Date).Date; $t.Repetition = (New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 30) -RepetitionDuration ([TimeSpan]::MaxValue)).Repetition; $t } }
+    [pscustomobject]@{ Key = 'ServerGroups'; Script = 'Invoke-ADServerGroupProvisioning.ps1'; Args = $ServerGroupsArgs; Trigger = { New-ScheduledTaskTrigger -Daily -At 4:00am } }
 )
+
+# The destructive hygiene jobs get NO restart-on-failure: a restart after a partial
+# run would let a failed job resume and delete/disable the NEXT batch, multiplying
+# the per-run MaxDeletes/MaxChanges safety cap. They cap blast radius per PROCESS.
+$noRestartKeys = @('DisableInactive', 'DeleteDisabled')
 
 if ($Include) { $catalogue = $catalogue | Where-Object { $Include -contains $_.Key } }
 
@@ -94,6 +100,8 @@ function New-Principal {
 }
 
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2) -DontStopOnIdleEnd -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 5)
+# Same settings but WITHOUT restart-on-failure, for the destructive jobs.
+$settingsNoRestart = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2) -DontStopOnIdleEnd
 
 Write-Host "AD-Automation scheduled-task installer" -ForegroundColor Cyan
 Write-Host ("ScriptRoot : {0}" -f $ScriptRoot)
@@ -119,12 +127,13 @@ foreach ($t in $catalogue) {
     $principal = New-Principal
 
     if ($PSCmdlet.ShouldProcess($taskName, 'Register scheduled task')) {
+        $taskSettings = if ($noRestartKeys -contains $t.Key) { $settingsNoRestart } else { $settings }
         $regParams = @{
             TaskName    = $taskName
             TaskPath    = $TaskFolder
             Action      = $action
             Trigger     = $trigger
-            Settings    = $settings
+            Settings    = $taskSettings
             Principal   = $principal
             Description = "AD-Automation: $($t.Script)"
             Force       = $true
@@ -146,8 +155,37 @@ foreach ($t in $catalogue) {
     }
 }
 
+# --- Windows Event Log (Applications and Services Logs > AD-Automation) ------
+# Pre-register the custom event log and one source per script while we are
+# elevated, so every scheduled run can mirror its log lines to Event Viewer from
+# the first execution. Best-effort: the scripts also self-register when running
+# as SYSTEM/gMSA, and degrade to console+file logging if the log is unavailable.
+if (-not $ListOnly) {
+    $modulePath = Join-Path $ScriptRoot 'ADAutomation.psd1'
+    if ((Test-Path -LiteralPath $modulePath) -and $PSCmdlet.ShouldProcess('AD-Automation event log', 'Register log + per-script sources')) {
+        try {
+            Import-Module $modulePath -Force -ErrorAction Stop
+            $sources = @(
+                'ADPasswordExpiry', 'ADLockout', 'ADDisableInactiveWarning',
+                'ADHygiene-DisableInactive', 'ADHygiene-DeleteDisabledUsers',
+                'ADDuplicatePassword', 'ADPasswordChangeAudit', 'ADServerGroupProvisioning'
+            )
+            if (Register-ADAutomationEventLog -LogName 'AD-Automation' -Sources $sources) {
+                Write-Host "Event log 'AD-Automation' registered (one source per script) - see Event Viewer > Applications and Services Logs." -ForegroundColor Green
+            }
+            else {
+                Write-Warning "Event log registration incomplete (see warnings above); scripts will retry when running elevated/SYSTEM."
+            }
+        }
+        catch { Write-Warning "Could not register the AD-Automation event log: $($_.Exception.Message)" }
+    }
+}
+
 Write-Host ''
 Write-Host 'Done. Review tasks in Task Scheduler under the task folder above.' -ForegroundColor Cyan
 if (($catalogue | Where-Object { $_.Key -in 'DisableInactive', 'DeleteDisabled' }) -and ($DisableInactiveArgs -contains '-DryRun' -or $DeleteDisabledArgs -contains '-DryRun')) {
     Write-Host 'NOTE: DisableInactive/DeleteDisabled are registered in -DryRun. Review their reports, then re-run this installer with live args for hands-off operation, e.g. -DisableInactiveArgs ''-Scheduled'' -DeleteDisabledArgs ''-Scheduled''.' -ForegroundColor Yellow
+}
+if (($catalogue | Where-Object { $_.Key -eq 'ServerGroups' }) -and ($ServerGroupsArgs -contains '-WhatIf')) {
+    Write-Host 'NOTE: ServerGroups is registered with -WhatIf (preview only, no group changes). Review its log, then re-run with -ServerGroupsArgs @() to go live.' -ForegroundColor Yellow
 }

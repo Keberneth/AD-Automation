@@ -9,7 +9,9 @@ external settings file without editing any script:
 
   - Import-ADAutomationConfig    : load settings from an external .psd1/.json file
   - Initialize-ADAutomationLog   : create the run log + output folder
-  - Write-ADAutomationLog        : timestamped logging to console + file
+  - Write-ADAutomationLog        : timestamped logging to console + file + Event Log
+  - Register-ADAutomationEventLog: create the AD-Automation Windows Event Log
+                                   (one event source per script; admin, one-time)
   - Send-ADAutomationMail        : UTF-8 mail, optional TLS + authentication
   - Resolve-ADManagerMail        : read the 'manager' attribute -> manager e-mail
   - Resolve-ADObjectMail         : read the 'mail' attribute of any account
@@ -33,6 +35,23 @@ Set-StrictMode -Version Latest
 
 $script:ModuleRoot = $PSScriptRoot
 $script:ADAutomationLogPath = $null
+
+# Per-process random salt for hash-group labels. Never persisted, so a label can
+# never be reversed to hash material across processes; stable within one run so
+# accounts sharing a password get the same label in a single report/e-mail.
+$script:ADAutomationMaskSalt = [guid]::NewGuid().ToByteArray()
+
+# Regex patterns already reported as invalid, so an unattended run warns once per
+# bad pattern instead of on every account it is tested against.
+$script:ADAutomationBadRegex = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+
+# Windows Event Log mirroring (set up by Initialize-ADAutomationLog). One custom
+# log ('AD-Automation' under Applications and Services Logs) with one event SOURCE
+# per script - Windows caps custom log names at 8 significant characters, so one
+# log per script would collide; filtering by Source gives per-script separation.
+$script:ADAutomationEventLogName = $null
+$script:ADAutomationEventSource = $null
+$script:ADAutomationEventLogEnabled = $false
 
 # ----------------------------------------------------------------------------
 # Configuration
@@ -67,8 +86,11 @@ function ConvertTo-ADAutomationHashtable {
         }
 
         # Arrays (but not strings) -> map elements; strings/scalars pass through.
+        # The unary comma stops the pipeline from unrolling the result, so a
+        # single-element JSON array stays an array (and an empty one stays @()),
+        # matching what Import-PowerShellDataFile would return for a .psd1.
         if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
-            return @($InputObject | ForEach-Object { ConvertTo-ADAutomationHashtable -InputObject $_ })
+            return , @($InputObject | ForEach-Object { ConvertTo-ADAutomationHashtable -InputObject $_ })
         }
 
         return $InputObject
@@ -113,10 +135,27 @@ function Import-ADAutomationConfig {
         [string]$Section
     )
 
+    # A path the caller explicitly asked for (parameter or environment variable)
+    # must exist. Silently falling through to the committed sample would make an
+    # unattended run execute with placeholder settings after a simple typo.
+    if (-not [string]::IsNullOrWhiteSpace($Path) -and -not (Test-Path -LiteralPath $Path)) {
+        throw "AD-Automation config path not found: '$Path' (from -Path/-ConfigPath)."
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:AD_AUTOMATION_CONFIG) -and -not (Test-Path -LiteralPath $env:AD_AUTOMATION_CONFIG)) {
+        throw "AD-Automation config path not found: '$env:AD_AUTOMATION_CONFIG' (from `$env:AD_AUTOMATION_CONFIG)."
+    }
+
     $file = Resolve-ADAutomationConfigPath -Path $Path
     if (-not $file) {
         Write-Verbose "AD-Automation: no settings file found; using built-in defaults."
         return @{}
+    }
+
+    # Landing on the committed sample means no real settings file exists yet; warn
+    # loudly because the placeholder 'contoso' values are almost never what an
+    # operator intends for a real (especially destructive) run.
+    if ($file -like '*settings.sample.psd1') {
+        Write-Warning "AD-Automation: using the committed SAMPLE settings ($file) - no real config found. Copy it to config\AD-Automation.settings.psd1 and edit it for your environment."
     }
 
     try {
@@ -200,25 +239,121 @@ function Protect-ADAutomationDirectory {
     }
 }
 
+function Register-ADAutomationEventLog {
+    <#
+    .SYNOPSIS
+    Ensures the AD-Automation Windows Event Log and one event source per script
+    exist (Event Viewer: Applications and Services Logs > <LogName>).
+
+    .DESCRIPTION
+    Creating a log/source writes HKLM registry keys and therefore needs
+    administrative rights - a one-time operation. The installer calls this while
+    elevated; scheduled runs as SYSTEM/gMSA also auto-register on first use.
+    Uses the .NET EventLog API directly so it works on Windows PowerShell 5.1 AND
+    PowerShell 7 (which removed New-EventLog/Write-EventLog). Never throws; returns
+    $true when every source is usable.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$LogName,
+        [Parameter(Mandatory = $true)][string[]]$Sources
+    )
+
+    $allOk = $true
+    foreach ($src in $Sources) {
+        if ([string]::IsNullOrWhiteSpace($src)) { continue }
+        try {
+            if (-not [System.Diagnostics.EventLog]::SourceExists($src)) {
+                $data = New-Object System.Diagnostics.EventSourceCreationData($src, $LogName)
+                [System.Diagnostics.EventLog]::CreateEventSource($data)
+            }
+            elseif ([System.Diagnostics.EventLog]::LogNameFromSourceName($src, '.') -ne $LogName) {
+                Write-Warning "Event source '$src' is already registered to another log ('$([System.Diagnostics.EventLog]::LogNameFromSourceName($src, '.'))'); leaving it as-is."
+                $allOk = $false
+            }
+        }
+        catch {
+            # Typically 'requested registry access is not allowed' when not elevated.
+            Write-Warning "Could not register event source '$src' in log '$LogName' (needs admin once): $($_.Exception.Message)"
+            $allOk = $false
+        }
+    }
+
+    # Give the log a sane retention policy (defaults are tiny). Best-effort.
+    try {
+        $el = New-Object System.Diagnostics.EventLog($LogName)
+        if ($el.MaximumKilobytes -lt 16384) { $el.MaximumKilobytes = 16384 }
+        $el.ModifyOverflowPolicy([System.Diagnostics.OverflowAction]::OverwriteAsNeeded, 7)
+        $el.Dispose()
+    }
+    catch { }
+
+    return $allOk
+}
+
+function Write-ADAutomationEventLogEntry {
+    # Internal: mirror one log line to the Windows Event Log. Disables itself on the
+    # first failure (e.g. source not yet registered and no rights to create it) so an
+    # unattended run degrades to console+file logging with a single notice.
+    param([string]$Message, [string]$Level)
+
+    if (-not $script:ADAutomationEventLogEnabled) { return }
+
+    $entryType = switch ($Level) {
+        'ERROR' { [System.Diagnostics.EventLogEntryType]::Error }
+        'WARN'  { [System.Diagnostics.EventLogEntryType]::Warning }
+        default { [System.Diagnostics.EventLogEntryType]::Information }
+    }
+    $eventId = switch ($Level) {
+        'INFO'   { 1000 }
+        'ACTION' { 1001 }
+        'WHATIF' { 1002 }
+        'SKIP'   { 1003 }
+        'WARN'   { 2000 }
+        'ERROR'  { 3000 }
+        default  { 1000 }
+    }
+
+    try {
+        [System.Diagnostics.EventLog]::WriteEntry($script:ADAutomationEventSource, $Message, $entryType, $eventId)
+    }
+    catch {
+        $script:ADAutomationEventLogEnabled = $false
+        # Write-Host directly - Write-ADAutomationLog would recurse into this function.
+        Write-Host "[WARN] Event Log mirroring disabled for this run (source '$($script:ADAutomationEventSource)' in log '$($script:ADAutomationEventLogName)'): $($_.Exception.Message). Run the installer elevated (or any script once as admin/SYSTEM) to register it." -ForegroundColor Yellow
+    }
+}
+
 function Initialize-ADAutomationLog {
     <#
     .SYNOPSIS
     Ensures the output folder exists (with a hardened ACL by default) and creates a
     timestamped run log. Returns an object with RunId / OutputRoot / LogPath.
-    Subsequent calls to Write-ADAutomationLog write to this log.
+    Subsequent calls to Write-ADAutomationLog write to this log - and, when
+    -EventLogEnabled, mirror to the Windows Event Log (Applications and Services
+    Logs > <EventLogName>) under a per-script event source.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$OutputRoot,
         [Parameter(Mandatory = $true)][string]$BaseName,
-        [bool]$Harden = $true
+        [bool]$Harden = $true,
+        [bool]$EventLogEnabled = $true,
+        [string]$EventLogName = 'AD-Automation',
+        # Event source shown in Event Viewer; defaults to BaseName (one per script).
+        [string]$EventLogSource = ''
     )
 
-    $created = $false
     if (-not (Test-Path -LiteralPath $OutputRoot)) {
         New-Item -ItemType Directory -Force -Path $OutputRoot -ErrorAction Stop | Out-Null
-        $created = $true
     }
+
+    # Harden on EVERY run, not only when we created the folder. The documented
+    # setup pre-creates this folder (smtp.cred, approval lists), and a folder that
+    # already exists otherwise keeps the permissive inherited C:\ProgramData ACL -
+    # leaving logs, PII reports, state and full-hash CSVs readable by all users.
+    # Protect-ADAutomationDirectory is idempotent and best-effort (never throws).
+    if ($Harden) { Protect-ADAutomationDirectory -Path $OutputRoot }
 
     # RunId includes the PID so two runs in the same second cannot collide.
     $runId = "{0}-{1}" -f (Get-Date -Format 'yyyyMMdd-HHmmss'), $PID
@@ -226,7 +361,18 @@ function Initialize-ADAutomationLog {
     New-Item -ItemType File -Force -Path $logPath -ErrorAction Stop | Out-Null
     $script:ADAutomationLogPath = $logPath
 
-    if ($Harden -and $created) { Protect-ADAutomationDirectory -Path $OutputRoot }
+    # Windows Event Log mirroring: one shared log, one source per script. Source
+    # registration needs admin once; scheduled runs (SYSTEM/gMSA, elevated) register
+    # automatically, and a non-admin interactive run degrades gracefully.
+    $script:ADAutomationEventLogEnabled = $false
+    if ($EventLogEnabled) {
+        $src = if ([string]::IsNullOrWhiteSpace($EventLogSource)) { $BaseName } else { $EventLogSource }
+        $script:ADAutomationEventLogName = $EventLogName
+        $script:ADAutomationEventSource = $src
+        [void](Register-ADAutomationEventLog -LogName $EventLogName -Sources @($src) -WarningAction SilentlyContinue)
+        # Enable optimistically; the first failed write disables it with one notice.
+        $script:ADAutomationEventLogEnabled = $true
+    }
 
     return [pscustomobject]@{
         RunId      = $runId
@@ -268,6 +414,8 @@ function Write-ADAutomationLog {
         try { Add-Content -LiteralPath $target -Value $line -Encoding UTF8 -ErrorAction Stop }
         catch { Write-Host "[$ts][ERROR] Failed to write log file '$target': $($_.Exception.Message)" -ForegroundColor Red }
     }
+
+    Write-ADAutomationEventLogEntry -Message $Message -Level $Level
 }
 
 # ----------------------------------------------------------------------------
@@ -326,6 +474,13 @@ function Send-ADAutomationMail {
         [pscredential]$Credential,
         [string]$CredentialPath
     )
+
+    # Strip control characters (incl. CR/LF) from the subject: a newline in an AD
+    # attribute (e.g. displayName) interpolated into the subject otherwise makes
+    # System.Net.Mail throw - silently dropping the message - and would be header
+    # injection under any mailer that does not reject bare CRLF.
+    $Subject = (($Subject -replace '[\x00-\x1F\x7F]', ' ').Trim())
+    if ($Subject.Length -gt 512) { $Subject = $Subject.Substring(0, 512) }
 
     $recipients = @($To | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.Trim() } | Sort-Object -Unique)
     if ($recipients.Count -eq 0) {
@@ -418,7 +573,18 @@ function Test-IsIgnoredName {
     if ($RegexList) {
         foreach ($pattern in $RegexList) {
             if ([string]::IsNullOrWhiteSpace($pattern)) { continue }
-            if ($Name -match $pattern) { return $true }
+            try {
+                if ([System.Text.RegularExpressions.Regex]::IsMatch($Name, $pattern)) { return $true }
+            }
+            catch {
+                # A malformed ignore pattern (config typo) must NOT abort the run or
+                # silently strip protection. Treat the account as ignored (the safe,
+                # no-action outcome for the destructive callers) and warn once.
+                if ($script:ADAutomationBadRegex.Add($pattern)) {
+                    Write-ADAutomationLog "Invalid ignore-list regex '$pattern' ($($_.Exception.Message)); treating matching accounts as IGNORED until it is fixed." 'WARN'
+                }
+                return $true
+            }
         }
     }
     return $false
@@ -489,9 +655,26 @@ function Resolve-ADObjectMail {
     try {
         $o = Get-ADObject @p
         if ($o -and -not [string]::IsNullOrWhiteSpace($o.mail)) { return [string]$o.mail }
+        return $null
     }
     catch {
-        Write-ADAutomationLog "Could not resolve mail for '$Identity': $($_.Exception.Message)" 'WARN'
+        # A manager DN can legitimately live in another domain of the forest, where
+        # the domain DC pinned in -Server returns ObjectNotFound. Retry once against
+        # a global catalog (port 3268) before giving up, so cross-domain managers
+        # are still resolved instead of silently degrading to the fallback list.
+        try {
+            if (-not [string]::IsNullOrWhiteSpace($Server)) {
+                $gcHost = ($Server -split ':')[0]
+            }
+            else {
+                $gcHost = @((Get-ADDomainController -Discover -Service GlobalCatalog -ErrorAction Stop).HostName)[0]
+            }
+            $o = Get-ADObject -Identity $Identity -Properties mail -Server ("{0}:3268" -f $gcHost) -ErrorAction Stop
+            if ($o -and -not [string]::IsNullOrWhiteSpace($o.mail)) { return [string]$o.mail }
+        }
+        catch {
+            Write-ADAutomationLog "Could not resolve mail for '$Identity' (incl. global-catalog retry): $($_.Exception.Message)" 'WARN'
+        }
     }
     return $null
 }
@@ -535,14 +718,30 @@ function Format-MaskedNtHash {
     <#
     .SYNOPSIS
     Returns a NON-reversible label for an NTLM hash so reports/e-mails can reference
-    a hash group without ever exposing the actual hash. Format: first5...last4 (len32).
+    a shared-password group without exposing any hash material.
+
+    .DESCRIPTION
+    The label is SHA-256 over a random per-process salt plus the hash, truncated to
+    32 bits and rendered as 'grp:XXXXXXXX'. Because the salt is random per run and
+    never persisted, the label leaks no bits of the real hash (unlike the old
+    first5...last4 form, whose 5-char prefix was exactly the HIBP k-anonymity prefix
+    and whose 9 exposed hex chars were enough to recover the full hash from the
+    public HIBP range API / an offline dictionary attack). Within a single run the
+    same hash always yields the same label, so accounts sharing a password still
+    correlate in the report and e-mail.
     #>
     [CmdletBinding()]
     param([string]$NtlmHash)
     if ([string]::IsNullOrWhiteSpace($NtlmHash)) { return '<none>' }
     $h = $NtlmHash.Trim().ToUpperInvariant()
-    if ($h.Length -lt 9) { return ('{0}***' -f $h.Substring(0, [Math]::Min(2, $h.Length))) }
-    return ('{0}...{1}' -f $h.Substring(0, 5), $h.Substring($h.Length - 4))
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = @($script:ADAutomationMaskSalt) + [System.Text.Encoding]::ASCII.GetBytes($h)
+        $digest = $sha.ComputeHash([byte[]]$bytes)
+    }
+    finally { $sha.Dispose() }
+    $hex = -join ($digest[0..3] | ForEach-Object { $_.ToString('x2') })
+    return ('grp:{0}' -f $hex.ToUpperInvariant())
 }
 
 function Test-NtlmHashPwned {
@@ -625,15 +824,19 @@ function Read-ADAutomationState {
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Path)
+    # Absent (or empty) state is a legitimate first run -> $null.
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
     try {
-        $raw = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
         return (ConvertFrom-Json $raw)
     }
     catch {
-        Write-ADAutomationLog "Could not read state file '$Path' (treating as empty): $($_.Exception.Message)" 'WARN'
-        return $null
+        # A present-but-corrupt state file is NOT a first run. Swallowing it would
+        # silently re-baseline (suppressing duplicate/pwned/lockout alerts for a
+        # whole cycle), so fail closed: surface the error and let the run abort.
+        Write-ADAutomationLog "State file '$Path' exists but is unreadable/corrupt: $($_.Exception.Message)" 'ERROR'
+        throw "Corrupt state file '$Path' - refusing to re-baseline. Inspect or delete it to reset intentionally: $($_.Exception.Message)"
     }
 }
 
@@ -645,9 +848,15 @@ function Save-ADAutomationState {
     )
     try {
         $json = $State | ConvertTo-Json -Depth 8
-        Set-Content -LiteralPath $Path -Value $json -Encoding UTF8 -ErrorAction Stop
+        # Write atomically: a crash/power-loss mid-write must not leave a truncated
+        # file that the next run would read as corrupt (or, previously, as empty and
+        # silently re-baseline). Write a sibling temp file, then replace in one step.
+        $tmp = "{0}.tmp.{1}" -f $Path, $PID
+        Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8 -ErrorAction Stop
+        Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
     }
     catch {
+        if ($tmp -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         Write-ADAutomationLog "Could not write state file '$Path': $($_.Exception.Message)" 'ERROR'
     }
 }
@@ -656,6 +865,7 @@ Export-ModuleMember -Function @(
     'Import-ADAutomationConfig',
     'Initialize-ADAutomationLog',
     'Protect-ADAutomationDirectory',
+    'Register-ADAutomationEventLog',
     'Write-ADAutomationLog',
     'Send-ADAutomationMail',
     'Get-ADAutomationDomainInfo',

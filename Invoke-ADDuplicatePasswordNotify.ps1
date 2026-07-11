@@ -56,6 +56,13 @@ param(
     [string]$Server = '',
     [string]$OutputRoot = 'C:\ProgramData\AD-Automation',
     [string]$LogFilePrefix = 'ADDuplicatePassword',
+
+    # Mirror log lines to the Windows Event Log (Applications and Services Logs >
+    # EventLogName, source = this script). Source registration needs one elevated
+    # run (the installer does it); non-admin runs degrade gracefully.
+    [bool]$EventLogEnabled = $true,
+    [string]$EventLogName = 'AD-Automation',
+
     [string]$ConfigPath = ''
 )
 
@@ -66,8 +73,10 @@ Import-Module $modulePath -Force -ErrorAction Stop
 
 $cfg = Import-ADAutomationConfig -Path $ConfigPath -Section 'DuplicatePasswordNotify'
 $boundKeys = @($PSBoundParameters.Keys)
+$overlaySkip = @('DryRun', 'Run')
 foreach ($k in @($cfg.Keys)) {
     if ($k -eq '__ConfigFile') { continue }
+    if ($overlaySkip -contains $k) { Write-Warning "Ignoring config key '$k': run mode is set on the command line only."; continue }
     if ($boundKeys -notcontains $k -and (Get-Variable -Name $k -Scope 0 -ErrorAction SilentlyContinue)) {
         Set-Variable -Name $k -Value $cfg[$k] -Scope 0
     }
@@ -79,9 +88,10 @@ foreach ($mod in 'ActiveDirectory', 'DSInternals') {
 }
 
 # --- Setup ------------------------------------------------------------------
-$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName $LogFilePrefix
+$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName $LogFilePrefix -EventLogEnabled $EventLogEnabled -EventLogName $EventLogName
 $whatIf = ($PSCmdlet.ParameterSetName -eq 'DryRun')
 
+$serverExplicit = -not [string]::IsNullOrWhiteSpace($Server)
 $di = Get-ADAutomationDomainInfo -Server $Server
 if ([string]::IsNullOrWhiteSpace($Server)) { $Server = $di.Server }
 $domainDN = $di.DistinguishedName
@@ -92,6 +102,15 @@ $mailCommon = @{
 }
 $targets = @($SamAccountName | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 $singleMode = ($targets.Count -gt 0)
+
+# Event-driven single-account runs (4720 trigger) fire on the DC that created the
+# account, seconds before it replicates to the PDC emulator. Read from the LOCAL DC
+# in that case (unless a server was explicitly requested) so the new account is not
+# missed as "not found".
+if ($singleMode -and -not $serverExplicit) {
+    $Server = $env:COMPUTERNAME
+    Write-ADAutomationLog "Single-account mode: reading from local DC '$Server' (event source) instead of the PDC emulator." 'INFO'
+}
 
 Write-ADAutomationLog "=== START (RunId=$($run.RunId)) ==="
 Write-ADAutomationLog ("Mode={0} ; Server={1} ; IncludeComputers={2} ; SingleAccountMode={3} ({4})" -f `
@@ -105,6 +124,11 @@ if ($repl.Count -eq 0) { throw "No replication accounts returned from $Server." 
 $samToHash = @{}
 $hashToSams = @{}
 $currentSams = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+# Track "known" accounts by their immutable SID, not sAMAccountName: a rename would
+# otherwise look like a brand-new account (false alert), and a delete+recreate that
+# reuses a sam would evade detection (false negative).
+$currentIds = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+$idToSam = @{}
 
 foreach ($ra in $repl) {
     $sam = [string]$ra.SamAccountName
@@ -113,7 +137,10 @@ foreach ($ra in $repl) {
     $hash = Convert-NtHashToHex -Bytes $ra.NTHash
     if ([string]::IsNullOrWhiteSpace($hash)) { continue }
 
+    $id = if ($ra.Sid) { [string]$ra.Sid.Value } else { "sam:$sam" }
     [void]$currentSams.Add($sam)
+    [void]$currentIds.Add($id)
+    $idToSam[$id] = $sam
     $samToHash[$sam] = $hash
     if (-not $hashToSams.ContainsKey($hash)) { $hashToSams[$hash] = New-Object System.Collections.Generic.List[string] }
     $hashToSams[$hash].Add($sam)
@@ -132,20 +159,22 @@ if ($singleMode) {
 }
 else {
     $state = Read-ADAutomationState -Path $statePath
-    if (-not $state -or -not $state.PSObject.Properties['KnownSams']) {
+    if (-not $state -or -not $state.PSObject.Properties['KnownIds']) {
         $baselineRun = $true
-        Write-ADAutomationLog 'First run: recording baseline of existing accounts (no alerts this run).' 'INFO'
+        Write-ADAutomationLog 'First run (or state upgraded to SID keys): recording baseline of existing accounts (no alerts this run).' 'INFO'
     }
     else {
         $known = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-        foreach ($s in @($state.KnownSams)) { [void]$known.Add([string]$s) }
-        $newSams = @($currentSams | Where-Object { -not $known.Contains($_) })
+        foreach ($s in @($state.KnownIds)) { [void]$known.Add([string]$s) }
+        $newIds = @($currentIds | Where-Object { -not $known.Contains($_) })
+        $newSams = @($newIds | ForEach-Object { $idToSam[$_] } | Where-Object { $_ })
         Write-ADAutomationLog "New accounts since last run: $($newSams.Count)"
     }
 }
 
 # --- Find collisions among the new accounts ---------------------------------
 $results = New-Object System.Collections.Generic.List[object]
+$alertPending = $false   # set when a detected collision could not be e-mailed
 if (-not $baselineRun) {
     foreach ($sam in $newSams) {
         $hash = $samToHash[$sam]
@@ -172,7 +201,8 @@ try {
 }
 catch { Write-ADAutomationLog "ERROR writing report: $($_.Exception.Message)" 'ERROR' }
 
-if ($WriteHashCsv -and $results.Count -gt 0) {
+# Full NTLM hashes are secret material; never write them during a -DryRun preview.
+if ($WriteHashCsv -and -not $whatIf -and $results.Count -gt 0) {
     $hashCsv = Join-Path $OutputRoot ("{0}-Hashes-{1}.csv" -f $LogFilePrefix, $run.RunId)
     $results | Select-Object NewAccount, SharedWith, NTHash | Export-Csv -Path $hashCsv -NoTypeInformation -Encoding UTF8
     Write-ADAutomationLog "FULL-HASH report written (treat as secret): $hashCsv" 'WARN'
@@ -195,20 +225,26 @@ Domain: $($di.DnsRoot)   Reported by: $($env:COMPUTERNAME)
     $subject = "AD duplicate-password alert: $($results.Count) new account(s) reuse an existing password"
 
     if ($whatIf) { Write-ADAutomationLog "WHATIF: would e-mail $($MailTo -join ', ') about $($results.Count) collision(s)." 'WHATIF' }
-    elseif ($SmtpServer -match '(?i)contoso\.') { Write-ADAutomationLog "Refusing to e-mail: SmtpServer still uses the 'contoso' placeholder." 'ERROR' }
-    else { [void](Send-ADAutomationMail @mailCommon -To $MailTo -Subject $subject -Body $body) }
+    elseif ($SmtpServer -match '(?i)contoso\.') { Write-ADAutomationLog "Refusing to e-mail: SmtpServer still uses the 'contoso' placeholder." 'ERROR'; $alertPending = $true }
+    elseif (Send-ADAutomationMail @mailCommon -To $MailTo -Subject $subject -Body $body) { }
+    else { $alertPending = $true; Write-ADAutomationLog "Alert e-mail FAILED to send; NOT advancing baseline so these collisions are re-checked next run." 'ERROR' }
 }
 else {
     Write-ADAutomationLog 'No duplicate-password collisions among new accounts.' 'INFO'
 }
 
 # --- Persist baseline state (scan mode, real run only) ----------------------
-if (-not $singleMode -and -not $whatIf) {
+# Do NOT advance the baseline when a detected collision could not be delivered:
+# leaving those accounts "new" makes the next run re-detect and re-alert them.
+if (-not $singleMode -and -not $whatIf -and -not $alertPending) {
     Save-ADAutomationState -Path $statePath -State ([pscustomobject]@{
-            KnownSams  = @($currentSams)
+            KnownIds   = @($currentIds)
             UpdatedUtc = (Get-Date).ToUniversalTime().ToString('o')
         })
-    Write-ADAutomationLog "State updated: $($currentSams.Count) known account(s)." 'INFO'
+    Write-ADAutomationLog "State updated: $($currentIds.Count) known account(s)." 'INFO'
+}
+elseif ($alertPending) {
+    Write-ADAutomationLog "State NOT advanced (undelivered alert) - collisions will be re-reported next run." 'WARN'
 }
 
 Write-ADAutomationLog "=== END (collisions=$($results.Count)) ==="

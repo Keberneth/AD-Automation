@@ -22,8 +22,11 @@ by default) so create-then-read never races replication.
 
 .NOTES
 - Requires the ActiveDirectory module and the ADAutomation module.
-- sAMAccountName is capped at 20 chars; a deterministic 32-bit-hash short form is
-  generated and verified unique (with numeric rotation on collision).
+- Group sAMAccountName is kept identical to the group name (groups allow up to 256
+  chars). Only names past that limit fall back to a deterministic 32-bit-hash short
+  form, verified unique with numeric rotation on collision.
+- Per-server resource groups are created with -GroupScope (default DomainLocal,
+  the AGDLP-correct scope for resource-access groups).
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Low')]
@@ -34,11 +37,24 @@ param(
     [string]$BaselineAdmin = '',
     [string]$BaselineRdp = '',
 
+    # Scope for the per-server resource groups. DomainLocal is correct AGDLP for
+    # resource-access groups and can contain baseline Global/Universal groups from
+    # any trusted domain; Global (the old hardcoded value) rejects a DomainLocal
+    # baseline. Existing groups are matched by CN and never re-scoped.
+    [ValidateSet('DomainLocal', 'Global', 'Universal')][string]$GroupScope = 'DomainLocal',
+
     # Target DC. Empty = PDC emulator (derived from AdminGroupOU's domain).
     [string]$Server = '',
     [int]$PauseSeconds = 0,
 
     [string]$OutputRoot = 'C:\ProgramData\AD-Automation',
+
+    # Mirror log lines to the Windows Event Log (Applications and Services Logs >
+    # EventLogName, source = this script). Source registration needs one elevated
+    # run (the installer does it); non-admin runs degrade gracefully.
+    [bool]$EventLogEnabled = $true,
+    [string]$EventLogName = 'AD-Automation',
+
     [string]$ConfigPath = ''
 )
 
@@ -75,12 +91,17 @@ if ($missing.Count -gt 0) {
 }
 
 # --- Setup ------------------------------------------------------------------
-$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName 'ADServerGroupProvisioning'
+$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName 'ADServerGroupProvisioning' -EventLogEnabled $EventLogEnabled -EventLogName $EventLogName
 
 # Pin one DC for the whole run (PDC emulator of the AdminGroupOU's domain).
 if ([string]::IsNullOrWhiteSpace($Server)) {
-    $dcs = [regex]::Matches($AdminGroupOU, 'DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value }
+    # Case-insensitive: DN attribute types are case-insensitive, so a valid lowercase
+    # 'dc=' must still yield the domain FQDN.
+    $dcs = [regex]::Matches($AdminGroupOU, '(?i)DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value }
     $domainFqdn = ($dcs -join '.')
+    if ([string]::IsNullOrWhiteSpace($domainFqdn)) {
+        throw "AdminGroupOU '$AdminGroupOU' has no DC= components - it does not look like a distinguished name. Set -Server explicitly or fix AdminGroupOU."
+    }
     try { $Server = (Get-ADDomain -Server $domainFqdn -ErrorAction Stop).PDCEmulator }
     catch { $Server = $domainFqdn; Write-ADAutomationLog "Could not resolve PDCEmulator for '$domainFqdn' (using DNS): $($_.Exception.Message)" 'WARN' }
 }
@@ -88,9 +109,14 @@ Write-ADAutomationLog "=== START (RunId=$($run.RunId)) === Server=$Server"
 
 # --- Helpers ----------------------------------------------------------------
 function Get-SafeSamAccountName {
+    # The 20-character cap applies to USER logon names, not groups: a group
+    # sAMAccountName may be up to 256 chars (built-in groups routinely exceed 20).
+    # Keep sam == CN so the group resolves under the name operators expect (GPO
+    # Restricted Groups, 'net localgroup DOMAIN\<name>', audit tooling); only fall
+    # back to a hash-suffixed short form past the real limit.
     param([Parameter(Mandatory)][string]$GroupName)
-    if ($GroupName.Length -le 20) { return $GroupName }
-    $prefix = $GroupName.Substring(0, 11)            # 11 + '-' + 8 hex = 20
+    if ($GroupName.Length -le 256) { return $GroupName }
+    $prefix = $GroupName.Substring(0, 247)           # 247 + '-' + 8 hex = 256
     $sha = [System.Security.Cryptography.SHA1]::Create()
     try { $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($GroupName)) }
     finally { $sha.Dispose() }
@@ -117,7 +143,7 @@ function Get-OrCreateAdGroup {
 
     if ($PSCmdlet.ShouldProcess("Group '$Name' in '$Path'", 'Create')) {
         try {
-            $created = New-ADGroup -Server $Server -Name $Name -SamAccountName $sam -GroupScope Global -GroupCategory Security -Path $Path -Description $Description -PassThru -ErrorAction Stop
+            $created = New-ADGroup -Server $Server -Name $Name -SamAccountName $sam -GroupScope $GroupScope -GroupCategory Security -Path $Path -Description $Description -PassThru -ErrorAction Stop
             Write-ADAutomationLog "CREATED group Name='$Name' Sam='$sam' DN='$($created.DistinguishedName)'" 'ACTION'
             return $created
         }
@@ -162,6 +188,13 @@ function Get-ComputersFromOUs {
 $baselineAdminObj = Get-ADGroup -Server $Server -Identity $BaselineAdmin -ErrorAction Stop
 $baselineRdpObj = Get-ADGroup -Server $Server -Identity $BaselineRdp -ErrorAction Stop
 
+# --- Preflight target OUs (a typo here would otherwise fail every New-ADGroup,
+#     one error per computer per day, while the run still reports success) ------
+foreach ($ouDn in @($AdminGroupOU, $RDPGroupOU)) {
+    try { $null = Get-ADObject -Server $Server -Identity $ouDn -ErrorAction Stop }
+    catch { throw "Target group OU not found: '$ouDn'. Error: $($_.Exception.Message)" }
+}
+
 # --- Load computers ---------------------------------------------------------
 $computers = Get-ComputersFromOUs -SearchBases $ComputerOUs -Server $Server
 if (-not $computers -or @($computers).Count -eq 0) {
@@ -178,21 +211,28 @@ foreach ($c in $computers) {
     $adminGroupName = "SRV-$serverId-Administrators"
     $rdpGroupName = "SRV-$serverId-RemoteDesktopUsers"
 
-    $adminGroup = Get-OrCreateAdGroup -Name $adminGroupName -Path $AdminGroupOU -Description "Per-server local admin delegation for $serverId" -Server $Server
-    $rdpGroup = Get-OrCreateAdGroup -Name $rdpGroupName -Path $RDPGroupOU -Description "Per-server RDP delegation for $serverId" -Server $Server
+    # Isolate each computer: one bad group ACL, scope conflict, or transient AD fault
+    # must not abort the whole unattended run (skipping every later server + the END
+    # summary). Log it and carry on, mirroring Get-OrCreateAdGroup's own handling.
+    try {
+        $adminGroup = Get-OrCreateAdGroup -Name $adminGroupName -Path $AdminGroupOU -Description "Per-server local admin delegation for $serverId" -Server $Server
+        $rdpGroup = Get-OrCreateAdGroup -Name $rdpGroupName -Path $RDPGroupOU -Description "Per-server RDP delegation for $serverId" -Server $Server
 
-    if ($adminGroup -and -not $adminGroup.PSObject.Properties['Simulated']) {
-        if (Add-GroupMemberIfMissing -TargetGroupDn $adminGroup.DistinguishedName -MemberDn $baselineAdminObj.DistinguishedName -MemberNameForLog $BaselineAdmin -Server $Server) { $addedAdmin++ }
-    }
-    elseif ($adminGroup) { Write-Verbose "[WhatIf] Would add $BaselineAdmin to $adminGroupName" }
+        if ($adminGroup -and -not $adminGroup.PSObject.Properties['Simulated']) {
+            if (Add-GroupMemberIfMissing -TargetGroupDn $adminGroup.DistinguishedName -MemberDn $baselineAdminObj.DistinguishedName -MemberNameForLog $BaselineAdmin -Server $Server) { $addedAdmin++ }
+        }
+        elseif ($adminGroup) { Write-Verbose "[WhatIf] Would add $BaselineAdmin to $adminGroupName" }
 
-    if ($rdpGroup -and -not $rdpGroup.PSObject.Properties['Simulated']) {
-        if (Add-GroupMemberIfMissing -TargetGroupDn $rdpGroup.DistinguishedName -MemberDn $baselineRdpObj.DistinguishedName -MemberNameForLog $BaselineRdp -Server $Server) { $addedRdp++ }
+        if ($rdpGroup -and -not $rdpGroup.PSObject.Properties['Simulated']) {
+            if (Add-GroupMemberIfMissing -TargetGroupDn $rdpGroup.DistinguishedName -MemberDn $baselineRdpObj.DistinguishedName -MemberNameForLog $BaselineRdp -Server $Server) { $addedRdp++ }
+        }
+        elseif ($rdpGroup) { Write-Verbose "[WhatIf] Would add $BaselineRdp to $rdpGroupName" }
     }
-    elseif ($rdpGroup) { Write-Verbose "[WhatIf] Would add $BaselineRdp to $rdpGroupName" }
+    catch { Write-ADAutomationLog "ERROR processing computer '$serverId' (continuing): $($_.Exception.Message)" 'ERROR' }
+
+    # Throttle BETWEEN computers so PauseSeconds actually paces DC writes.
+    if ($PauseSeconds -gt 0) { Start-Sleep -Seconds $PauseSeconds }
 }
-
-if ($PauseSeconds -gt 0) { Start-Sleep -Seconds $PauseSeconds }
 
 Write-ADAutomationLog "=== END === ComputersProcessed=$(@($computers).Count) AdminNested=$addedAdmin RdpNested=$addedRdp" 'INFO'
 Write-Output "Done. Computers processed (deduped): $(@($computers).Count)"

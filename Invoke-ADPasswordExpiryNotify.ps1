@@ -62,6 +62,12 @@ param(
     [string]$OutputRoot = 'C:\ProgramData\AD-Automation',
     [string]$LogFilePrefix = 'ADPasswordExpiry',
 
+    # Mirror log lines to the Windows Event Log (Applications and Services Logs >
+    # EventLogName, source = this script). Source registration needs one elevated
+    # run (the installer does it); non-admin runs degrade gracefully.
+    [bool]$EventLogEnabled = $true,
+    [string]$EventLogName = 'AD-Automation',
+
     [string]$ConfigPath = ''
 )
 
@@ -72,8 +78,10 @@ Import-Module $modulePath -Force -ErrorAction Stop
 
 $cfg = Import-ADAutomationConfig -Path $ConfigPath -Section 'PasswordExpiryNotify'
 $boundKeys = @($PSBoundParameters.Keys)
+$overlaySkip = @('DryRun', 'Run')
 foreach ($k in @($cfg.Keys)) {
     if ($k -eq '__ConfigFile') { continue }
+    if ($overlaySkip -contains $k) { Write-Warning "Ignoring config key '$k': run mode is set on the command line only."; continue }
     if ($boundKeys -notcontains $k -and (Get-Variable -Name $k -Scope 0 -ErrorAction SilentlyContinue)) {
         Set-Variable -Name $k -Value $cfg[$k] -Scope 0
     }
@@ -85,7 +93,7 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 Import-Module ActiveDirectory -ErrorAction Stop
 
 # --- Setup ------------------------------------------------------------------
-$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName $LogFilePrefix
+$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName $LogFilePrefix -EventLogEnabled $EventLogEnabled -EventLogName $EventLogName
 $CsvPath = Join-Path $OutputRoot ("{0}-Report-{1}.csv" -f $LogFilePrefix, $run.RunId)
 
 $whatIf = ($PSCmdlet.ParameterSetName -eq 'DryRun')
@@ -102,6 +110,17 @@ $mailCommon = @{
 }
 if ($SmtpServer -match '(?i)contoso\.') {
     Write-ADAutomationLog "SmtpServer is still the sample 'contoso' placeholder; configure config\AD-Automation.settings.psd1." 'WARN'
+}
+
+# Discrete NotifyDays thresholds larger than the notify window would be silently
+# discarded by the window pre-filter below. Widen the window to cover them.
+$cleanNotifyDays = @($NotifyDays | Where-Object { $_ -ge 0 })
+if ($cleanNotifyDays.Count -gt 0) {
+    $maxNotify = ($cleanNotifyDays | Measure-Object -Maximum).Maximum
+    if ($maxNotify -gt $NotifyWindowDays) {
+        Write-ADAutomationLog "NotifyDays max ($maxNotify) exceeds NotifyWindowDays ($NotifyWindowDays); widening the window so those reminders can fire." 'INFO'
+        $NotifyWindowDays = $maxNotify
+    }
 }
 
 $today = (Get-Date).Date
@@ -122,6 +141,9 @@ Write-ADAutomationLog ("Mode={0} ; WhatIf={1} ; NotifyWindowDays={2} ; NotifyDay
 Write-ADAutomationLog ("SMTP={0}:{1} From={2} SSL={3} AdminTo={4}" -f $SmtpServer, $SmtpPort, $MailFrom, $MailUseSsl, ($AdminMailTo -join ','))
 
 $report = New-Object System.Collections.Generic.List[object]
+# De-duplicate users seen via overlapping/nested search bases so nobody is e-mailed
+# (or counted) twice in one run.
+$seenUsers = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
 foreach ($base in $userBases) {
     Write-ADAutomationLog "Processing OU: $base"
@@ -139,6 +161,7 @@ foreach ($base in $userBases) {
         try {
             if (-not $u.Enabled) { continue }
             if ($u.PasswordNeverExpires) { continue }
+            if (-not $seenUsers.Add([string]$u.DistinguishedName)) { continue }
             if (Test-IsIgnoredName -Name $u.SamAccountName -ExactList $IgnoreAccountsExact) { continue }
 
             $expiryFileTime = $u.'msDS-UserPasswordExpiryTimeComputed'
@@ -151,7 +174,10 @@ foreach ($base in $userBases) {
                 continue
             }
 
-            if ($expiry -gt $windowEnd) { continue }
+            # Compare on the DATE (windowEnd is midnight): otherwise an expiry with any
+            # time-of-day on the last day is excluded, making daysLeft == NotifyWindowDays
+            # unreachable and the documented '-NotifyDays 14,...' 14-day reminder silent.
+            if ($expiry.Date -gt $windowEnd) { continue }
 
             # Whole calendar days remaining: "expires today" = 0, "expires in N days" = N.
             $daysLeft = ($expiry.Date - $today).Days

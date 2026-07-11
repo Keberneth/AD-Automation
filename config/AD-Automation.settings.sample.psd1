@@ -41,11 +41,23 @@
         # Where operational/admin mail goes (summaries, alerts).
         AdminMailTo = @('it-operations@contoso.local')
 
-        # Root folder for logs/CSV/state. Created with a restricted ACL
-        # (SYSTEM + Administrators + the running account only).
+        # Root folder for logs/CSV/state. Hardened to a restricted ACL
+        # (SYSTEM + Administrators + the running account only) on every run.
         OutputRoot = 'C:\ProgramData\AD-Automation'
 
+        # --- Windows Event Log -----------------------------------------------
+        # Mirror every log line to Event Viewer: Applications and Services Logs >
+        # EventLogName, with one event SOURCE per script (filter by Source for a
+        # per-script view). Event IDs: 1000 INFO, 1001 ACTION, 1002 WHATIF,
+        # 1003 SKIP, 2000 WARN, 3000 ERROR. The log/sources are registered by the
+        # installer (elevated) or automatically on the first SYSTEM/gMSA run.
+        EventLogEnabled = $true
+        EventLogName    = 'AD-Automation'
+
         # Target DC. Empty = auto-detect (PDC emulator) so it works in any domain.
+        # NOTE: Server does NOT apply to Invoke-ADHygieneDeleteDisabledUsers (it
+        # always resolves each domain's PDC emulator) or Invoke-ADLockoutNotify
+        # (which uses DcServer / AllDomainControllers instead).
         Server = ''
     }
 
@@ -71,7 +83,10 @@
         ServiceInactiveForDays  = 180
         ComputerInactiveForDays = 60
 
-        MaxChanges       = 0                   # 0 = unlimited (per object)
+        MaxChanges       = 25                  # per-run blast-radius cap; 0 = unlimited
+        # Where the -DryRun -EmailApprovalList package goes (this script uses MailTo,
+        # not AdminMailTo). Set a real address once SMTP is configured.
+        MailTo           = @('it-operations@contoso.local')
         # OPTIONAL: only used if you run with -RequireApprovalList (manual change-control).
         # Hands-off operation needs NO approval list - leave -RequireApprovalList off.
         ApprovalListPath = 'C:\ProgramData\AD-Automation\DisableInactive-ApprovalList.txt'
@@ -89,6 +104,8 @@
         DisabledForDays   = 180
         DisableDateSource = 'ReplicationMetadata'   # ReplicationMetadata | WhenChanged | StampAttribute
         MaxDeletes        = 25                       # blast-radius cap; pass -Unlimited to lift
+        # Where the -DryRun -EmailApprovalList package goes (this script uses MailTo).
+        MailTo            = @('it-operations@contoso.local')
         # OPTIONAL: only used if you run with -RequireApprovalList (manual change-control).
         # Hands-off operation needs NO approval list.
         ApprovalListPath  = 'C:\ProgramData\AD-Automation\DeleteDisabled-ApprovalList.txt'
@@ -122,18 +139,21 @@
     # Invoke-ADDisableInactiveWarning.ps1  (warn BEFORE a user is disabled)
     # =======================================================================
     DisableInactiveWarning = @{
-        # Keep in sync with DisableInactive.UserInactiveForDays.
-        UserInactiveForDays = 90
-        WarnDays            = @(14, 7, 1)   # warn this many days before the disable date
-        UserLimitToOUs      = @(
+        # Keep these in sync with the DisableInactive section so the projected disable
+        # date and the set of ignored/service accounts match the actual disable job.
+        UserInactiveForDays    = 90
+        ServiceInactiveForDays = 180
+        WarnDays               = @(14, 7, 1)   # warn this many days before the disable date
+        UserLimitToOUs         = @(
             'OU=Users,DC=contoso,DC=local',
             'OU=Contractors,DC=contoso,DC=local'
         )
         # Extra recipients ALWAYS added on top of the user's manager.
-        AdditionalMailTo    = @('it-operations@contoso.local')
+        AdditionalMailTo       = @('it-operations@contoso.local')
         IncludeServiceAccounts = $false
-        IgnoreAccountsExact = @('Administrator', 'Guest', 'krbtgt', 'DefaultAccount', 'WDAGUtilityAccount')
-        IgnoreAccountsRegex = @('^AZURE', '^MSOL', '^BTG', '^DWM-')
+        ServiceAccountOUs      = @('OU=Service Accounts,DC=contoso,DC=local')
+        IgnoreAccountsExact    = @('Administrator', 'Guest', 'krbtgt', 'DefaultAccount', 'WDAGUtilityAccount')
+        IgnoreAccountsRegex    = @('^AZURE', '^MSOL', '^BTG', '^DWM-', '^SM_', '^HealthMailbox')
     }
 
     # =======================================================================
@@ -169,5 +189,8 @@
         RDPGroupOU    = 'OU=Server Remote Desktop,OU=Groups,DC=contoso,DC=local'
         BaselineAdmin = 'Contoso-Server-Administrators'
         BaselineRdp   = 'Contoso-Server-RDP'
+        # Scope for the per-server resource groups: DomainLocal (AGDLP, default) |
+        # Global | Universal. DomainLocal can nest baseline Global/Universal groups.
+        GroupScope    = 'DomainLocal'
     }
 }

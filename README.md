@@ -4,6 +4,29 @@ A small library of **standalone PowerShell scripts** that keep Active Directory
 healthy and secure, designed to run **unattended via Scheduled Tasks** with
 **no per-run busy-work**.
 
+> ## ⚠️ Stay in control — read this before automating
+>
+> These scripts make real changes to Active Directory (disabling, moving and
+> deleting accounts) and send e-mail on your organisation's behalf. Automation
+> is only safe when **you** stay in control of it:
+>
+> 1. **Know what you are automating.** Only point a job at a part of the
+>    directory you have under control — you should be able to predict what a
+>    run will touch before it runs.
+> 2. **Align the settings with your organisation's policy.** The defaults
+>    (thresholds, OUs, ignore lists, caps) are generic starting points, *not*
+>    policy. Review every value in `config\AD-Automation.settings.psd1` against
+>    your own account-lifecycle rules before scheduling anything — otherwise a
+>    run can have unexpected consequences.
+> 3. **Test in a controlled environment first.** Run the whole setup in a lab or
+>    test domain (or at least against a small, non-critical OU) before pointing
+>    it at production, so you see exactly how the jobs behave with your policy
+>    settings — without production consequences.
+> 4. **Always start with a dry run.** Every job supports `-DryRun`: it changes
+>    nothing and writes a CSV report + log showing exactly what a live run
+>    would have done. Review that output first, and only then switch the job to
+>    `-Run` / `-Scheduled`.
+
 ---
 
 # Short version (TL;DR)
@@ -43,11 +66,13 @@ Then schedule everything at once:
 | `Invoke-ADPasswordChangeAudit.ps1` | **Every 30 min** *or* event 4723/4724 | `-Run` | On password change: duplicate + pwned checks |
 | `Invoke-ADHygieneDisableInactive.ps1` | **Daily** (02:00) | `-Scheduled` | Disable inactive users/computers, move to a Disabled OU |
 | `Invoke-ADHygieneDeleteDisabledUsers.ps1` | **Weekly** (Sun 03:00) | `-Scheduled` | Delete users disabled for ≥ N days |
-| `Invoke-ADServerGroupProvisioning.ps1` | **Daily** (04:00) | *(none)* | Create per-server Admin/RDP groups, nest baselines |
+| `Invoke-ADServerGroupProvisioning.ps1` | **Daily** (04:00) | *live = no switch* | Create per-server Admin/RDP groups, nest baselines |
 
-> The destructive jobs (disable/delete) install in `-DryRun` first — review the
-> report, then switch to `-Scheduled`. **No approval list is required**; the
-> disabled-for-N-days threshold and per-run caps are the automatic safety net.
+> The three AD-writing jobs install in preview first — `DisableInactive`/`DeleteDisabled`
+> in `-DryRun`, `ServerGroups` in `-WhatIf`. Review the report/log, then switch them
+> live (`-Scheduled` for the hygiene jobs, remove `-WhatIf` for `ServerGroups`).
+> **No approval list is required**; the disabled-for-N-days threshold and per-run
+> caps are the automatic safety net.
 > Notifications need only a working SMTP relay. The two password jobs additionally
 > need **DSInternals** + replication rights and should run on/near a DC.
 
@@ -145,14 +170,20 @@ Get-Credential | Export-Clixml 'C:\ProgramData\AD-Automation\smtp.cred'
 | Delete disabled users | **Weekly** (off-hours) | Low churn; weekly avoids noise. Start in `-DryRun`, then `-Scheduled`. |
 | Server group provisioning | **Daily** or on-demand | New servers get their groups by the next day; idempotent so re-runs are cheap. |
 
-> Make the lockout interval **≥** its `-LookbackMinutes`. The installer wires these
-> cadences up for you; see [docs/SCHEDULED-TASKS.md](docs/SCHEDULED-TASKS.md) for
-> manual `Register-ScheduledTask` examples and **event-driven** triggers.
+> Set `-LookbackMinutes` **≥** the lockout run interval (the installer uses a
+> 15-min interval with `-LookbackMinutes 20`), so a delayed or skipped cycle is
+> still covered; the per-DC high-water mark prevents duplicate mail on the overlap,
+> and a missed run is caught up from the last successful run. The installer wires
+> these cadences up for you; see [docs/SCHEDULED-TASKS.md](docs/SCHEDULED-TASKS.md)
+> for manual `Register-ScheduledTask` examples and **event-driven** triggers.
 
 ## The scripts in detail
 
-Each script accepts `-DryRun` (preview) and writes a timestamped **log + CSV** to
-`OutputRoot` (default `C:\ProgramData\AD-Automation`, created with a restricted ACL).
+Most scripts accept `-DryRun` (preview) and write a timestamped **log + CSV** to
+`OutputRoot` (default `C:\ProgramData\AD-Automation`, whose ACL is hardened on every
+run — best-effort — to SYSTEM, Administrators and the run-as account). The exception
+is `Invoke-ADServerGroupProvisioning.ps1`: its preview switch is `-WhatIf` (it has no
+`-DryRun` and writes only a log, no CSV).
 
 ### Notifications
 
@@ -195,9 +226,13 @@ Each script accepts `-DryRun` (preview) and writes a timestamped **log + CSV** t
   `-SamAccountName` for event-driven (4723/4724) runs. E-mails `MailTo`.
   *Every 30 min or on 4723/4724.*
 
-Both hash scripts use **k-anonymity** for HIBP (only the first 5 hex chars of a
-hash ever leave the host) and **never e-mail raw NTLM hashes** — only a masked
-label like `8846F...586C`. Full hashes hit disk only with `-WriteHashCsv`.
+Only `Invoke-ADPasswordChangeAudit.ps1` contacts Have I Been Pwned, and it uses
+**k-anonymity** (only the first 5 hex chars of a hash ever leave the host);
+`Invoke-ADDuplicatePasswordNotify.ps1` makes no outbound calls and compares hashes
+locally. Neither script **e-mails raw NTLM hashes** — reports and mail carry only an
+opaque per-run group label (e.g. `grp:1A2B3C4D`) that correlates accounts sharing a
+password without exposing any hash bits. Full hashes hit disk only with
+`-WriteHashCsv` (never during `-DryRun`).
 
 ### Provisioning
 
@@ -210,13 +245,44 @@ label like `8846F...586C`. Full hashes hit disk only with `-WriteHashCsv`.
 
 - **Dry-run first.** `-DryRun` changes nothing and writes a CSV + log.
 - **Automatic, low-friction guardrails.** Day thresholds + per-run caps
-  (`MaxChanges` / `MaxDeletes`, default 25) + ignore lists protect you without any
-  list to maintain. An optional `-RequireApprovalList` is there only if you want it.
-- **Restricted output.** `OutputRoot` is created with an ACL limited to SYSTEM,
-  Administrators and the run-as account.
+  (`MaxChanges` / `MaxDeletes`, both default **25**) + ignore lists protect you
+  without any list to maintain. An optional `-RequireApprovalList` is there only if
+  you want it.
+- **Restricted output.** `OutputRoot`'s ACL is hardened on every run (best-effort)
+  to SYSTEM, Administrators and the run-as account — including when the folder was
+  pre-created.
 - **TLS-capable, UTF-8 mail.** Swedish characters (å ä ö) survive; set
   `MailUseSsl` / `MailCredentialPath` to encrypt and authenticate.
 - **No secrets leaked.** Password jobs mask hashes and use HIBP k-anonymity.
+
+## Logging & monitoring
+
+Every run logs three ways:
+
+1. **Console** — colour-coded when run interactively.
+2. **File** — a timestamped `.log` (plus CSV report) per run under `OutputRoot`.
+3. **Windows Event Log** — mirrored to **Event Viewer → Applications and Services
+   Logs → `AD-Automation`**, with **one event source per script** (filter by
+   *Source* for a per-script view — Windows limits custom log *names* to 8
+   significant characters, so separate logs per script would collide; sources are
+   the supported way to separate them). Event IDs: `1000` INFO, `1001` ACTION,
+   `1002` WHATIF, `1003` SKIP, `2000` WARN, `3000` ERROR — so you can attach a
+   Task Scheduler alert or SIEM rule to, say, every `3000` in this log.
+
+The event log and its sources are registered automatically by the installer
+(elevated) or on the first run as SYSTEM/gMSA; disable the mirroring with
+`EventLogEnabled = $false` in `[Common]`. Query it from PowerShell:
+
+```powershell
+# Everything the delete job logged today
+Get-WinEvent -FilterHashtable @{
+    LogName = 'AD-Automation'; ProviderName = 'ADHygiene-DeleteDisabledUsers'
+    StartTime = (Get-Date).Date
+} | Format-Table TimeCreated, Id, Message -AutoSize
+
+# All errors from any AD-Automation script in the last 7 days
+Get-WinEvent -FilterHashtable @{ LogName = 'AD-Automation'; Level = 2; StartTime = (Get-Date).AddDays(-7) }
+```
 
 ## Automating it (Scheduled Tasks)
 

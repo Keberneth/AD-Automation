@@ -62,6 +62,13 @@ param(
     [string]$Server = '',
     [string]$OutputRoot = 'C:\ProgramData\AD-Automation',
     [string]$LogFilePrefix = 'ADPasswordChangeAudit',
+
+    # Mirror log lines to the Windows Event Log (Applications and Services Logs >
+    # EventLogName, source = this script). Source registration needs one elevated
+    # run (the installer does it); non-admin runs degrade gracefully.
+    [bool]$EventLogEnabled = $true,
+    [string]$EventLogName = 'AD-Automation',
+
     [string]$ConfigPath = ''
 )
 
@@ -72,8 +79,10 @@ Import-Module $modulePath -Force -ErrorAction Stop
 
 $cfg = Import-ADAutomationConfig -Path $ConfigPath -Section 'PasswordChangeAudit'
 $boundKeys = @($PSBoundParameters.Keys)
+$overlaySkip = @('DryRun', 'Run')
 foreach ($k in @($cfg.Keys)) {
     if ($k -eq '__ConfigFile') { continue }
+    if ($overlaySkip -contains $k) { Write-Warning "Ignoring config key '$k': run mode is set on the command line only."; continue }
     if ($boundKeys -notcontains $k -and (Get-Variable -Name $k -Scope 0 -ErrorAction SilentlyContinue)) {
         Set-Variable -Name $k -Value $cfg[$k] -Scope 0
     }
@@ -85,13 +94,13 @@ foreach ($mod in 'ActiveDirectory', 'DSInternals') {
 }
 
 # --- Setup ------------------------------------------------------------------
-$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName $LogFilePrefix
+$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName $LogFilePrefix -EventLogEnabled $EventLogEnabled -EventLogName $EventLogName
 $whatIf = ($PSCmdlet.ParameterSetName -eq 'DryRun')
 
+$serverExplicit = -not [string]::IsNullOrWhiteSpace($Server)
 $di = Get-ADAutomationDomainInfo -Server $Server
 if ([string]::IsNullOrWhiteSpace($Server)) { $Server = $di.Server }
 $domainDN = $di.DistinguishedName
-$srv = @{ Server = $Server }
 
 $mailCommon = @{
     From = $MailFrom; SmtpServer = $SmtpServer; SmtpPort = $SmtpPort
@@ -99,6 +108,15 @@ $mailCommon = @{
 }
 $targets = @($SamAccountName | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 $singleMode = ($targets.Count -gt 0)
+
+# Event-driven single-account runs (4723/4724 trigger) fire on the DC where the
+# password changed, before it replicates. Read the fresh hash from the LOCAL DC in
+# that case (unless a server was explicitly requested).
+if ($singleMode -and -not $serverExplicit) {
+    $Server = $env:COMPUTERNAME
+    Write-ADAutomationLog "Single-account mode: reading from local DC '$Server' (event source) instead of the PDC emulator." 'INFO'
+}
+$srv = @{ Server = $Server }
 
 Write-ADAutomationLog "=== START (RunId=$($run.RunId)) ==="
 Write-ADAutomationLog ("Mode={0} ; Server={1} ; CheckPwned={2} ; SingleAccountMode={3} ({4})" -f `
@@ -109,6 +127,7 @@ $statePath = Get-ADAutomationStatePath -OutputRoot $OutputRoot -Name 'PasswordCh
 $changedSams = @()
 $baselineRun = $false
 $currentPwdLastSet = @{}
+$queryFailed = $false   # a base query failed -> do NOT overwrite state (would evict that OU)
 
 if ($singleMode) {
     $changedSams = $targets
@@ -130,7 +149,7 @@ else {
                 $currentPwdLastSet[$sam] = $ticks
             }
         }
-        catch { Write-ADAutomationLog "ERROR querying '$base': $($_.Exception.Message)" 'ERROR' }
+        catch { Write-ADAutomationLog "ERROR querying '$base': $($_.Exception.Message)" 'ERROR'; $queryFailed = $true }
     }
 
     $state = Read-ADAutomationState -Path $statePath
@@ -161,6 +180,8 @@ $changedSams = @($changedSams | Where-Object { -not (Test-IsIgnoredName -Name $_
 
 # --- Audit the changed accounts ---------------------------------------------
 $results = New-Object System.Collections.Generic.List[object]
+$alertPending = $false                 # a finding could not be e-mailed
+$recheckSams = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 if (-not $baselineRun -and $changedSams.Count -gt 0) {
 
     Write-ADAutomationLog 'Reading replicated account hashes for duplicate comparison (Get-ADReplAccount -All)...'
@@ -193,7 +214,11 @@ if (-not $baselineRun -and $changedSams.Count -gt 0) {
 
         $isDuplicate = ($others.Count -gt 0)
         $isPwned = ($pwned -eq 'Yes')
-        if ($isDuplicate -or $isPwned) {
+        # A failed HIBP lookup is NOT 'clean': surface it and schedule a re-check so
+        # a transient outage cannot permanently hide a breached password.
+        $lookupFailed = ($pwned -eq 'LookupFailed')
+        if ($lookupFailed) { [void]$recheckSams.Add($sam) }
+        if ($isDuplicate -or $isPwned -or $lookupFailed) {
             $results.Add([pscustomobject]@{
                     Account     = $sam
                     Duplicate   = $isDuplicate
@@ -219,7 +244,8 @@ try {
 }
 catch { Write-ADAutomationLog "ERROR writing report: $($_.Exception.Message)" 'ERROR' }
 
-if ($WriteHashCsv -and $results.Count -gt 0) {
+# Full NTLM hashes are secret material; never write them during a -DryRun preview.
+if ($WriteHashCsv -and -not $whatIf -and $results.Count -gt 0) {
     $hashCsv = Join-Path $OutputRoot ("{0}-Hashes-{1}.csv" -f $LogFilePrefix, $run.RunId)
     $results | Select-Object Account, SharedWith, Pwned, NTHash | Export-Csv -Path $hashCsv -NoTypeInformation -Encoding UTF8
     Write-ADAutomationLog "FULL-HASH report written (treat as secret): $hashCsv" 'WARN'
@@ -230,7 +256,8 @@ if ($results.Count -gt 0) {
         $bits = @()
         if ($_.Duplicate) { $bits += "reused by: $($_.SharedWith)" }
         if ($_.Pwned -eq 'Yes') { $bits += "PWNED (seen $($_.PwnedCount) times)" }
-        " - $($_.Account): $($bits -join '; ')  [hash $($_.HashLabel)]"
+        if ($_.Pwned -eq 'LookupFailed') { $bits += 'pwned check UNVERIFIED (HIBP unreachable - will re-check next run)' }
+        " - $($_.Account): $($bits -join '; ')  [$($_.HashLabel)]"
     }
     $body = @"
 The following account(s) changed their password to one that is weak/reused:
@@ -247,20 +274,30 @@ Domain: $($di.DnsRoot)   Reported by: $($env:COMPUTERNAME)
     $subject = "AD password-change audit: $($results.Count) account(s) with reused/pwned passwords"
 
     if ($whatIf) { Write-ADAutomationLog "WHATIF: would e-mail $($MailTo -join ', ') about $($results.Count) finding(s)." 'WHATIF' }
-    elseif ($SmtpServer -match '(?i)contoso\.') { Write-ADAutomationLog "Refusing to e-mail: SmtpServer still uses the 'contoso' placeholder." 'ERROR' }
-    else { [void](Send-ADAutomationMail @mailCommon -To $MailTo -Subject $subject -Body $body) }
+    elseif ($SmtpServer -match '(?i)contoso\.') { Write-ADAutomationLog "Refusing to e-mail: SmtpServer still uses the 'contoso' placeholder." 'ERROR'; $alertPending = $true }
+    elseif (Send-ADAutomationMail @mailCommon -To $MailTo -Subject $subject -Body $body) { }
+    else { $alertPending = $true; Write-ADAutomationLog "Alert e-mail FAILED to send; NOT advancing state so these findings are re-checked next run." 'ERROR' }
 }
 else {
     Write-ADAutomationLog 'No reused/pwned passwords among changed accounts.' 'INFO'
 }
 
 # --- Persist state (scan mode, real run only) -------------------------------
-if (-not $singleMode -and -not $whatIf -and $currentPwdLastSet.Count -gt 0) {
+# Skip the save entirely when a base query failed (a partial snapshot would evict a
+# whole OU and cause a mass false-positive audit next run) or when an alert could
+# not be delivered (findings must be re-checked). Otherwise drop accounts whose HIBP
+# lookup failed so they are re-audited next run instead of being marked done.
+if (-not $singleMode -and -not $whatIf -and $currentPwdLastSet.Count -gt 0 -and -not $queryFailed -and -not $alertPending) {
+    foreach ($rs in @($recheckSams)) { [void]$currentPwdLastSet.Remove($rs) }
     Save-ADAutomationState -Path $statePath -State ([pscustomobject]@{
             PwdLastSet = $currentPwdLastSet
             UpdatedUtc = (Get-Date).ToUniversalTime().ToString('o')
         })
-    Write-ADAutomationLog "State updated: $($currentPwdLastSet.Count) account(s) tracked." 'INFO'
+    Write-ADAutomationLog "State updated: $($currentPwdLastSet.Count) account(s) tracked (deferred re-check: $($recheckSams.Count))." 'INFO'
+}
+elseif (-not $singleMode -and -not $whatIf) {
+    $why = if ($queryFailed) { 'a base query failed' } elseif ($alertPending) { 'an alert could not be delivered' } else { 'no accounts tracked' }
+    Write-ADAutomationLog "State NOT advanced ($why) - affected accounts will be re-audited next run." 'WARN'
 }
 
 Write-ADAutomationLog "=== END (findings=$($results.Count)) ==="

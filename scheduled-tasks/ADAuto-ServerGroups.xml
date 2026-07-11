@@ -2,7 +2,7 @@
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Author>AD-Automation</Author>
-    <Description>AD-Automation: create per-server Admin/RDP groups and nest baselines</Description>
+    <Description>AD-Automation: create per-server Admin/RDP groups and nest baselines (WhatIf - remove -WhatIf to go live)</Description>
   </RegistrationInfo>
   <Triggers>
     <CalendarTrigger>
@@ -47,7 +47,7 @@
   <Actions>
     <Exec>
       <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
-      <Arguments>-NoProfile -ExecutionPolicy Bypass -File "C:\AD-Automation\Invoke-ADServerGroupProvisioning.ps1"</Arguments>
+      <Arguments>-NoProfile -ExecutionPolicy Bypass -File "C:\AD-Automation\Invoke-ADServerGroupProvisioning.ps1" -WhatIf</Arguments>
       <WorkingDirectory>C:\AD-Automation</WorkingDirectory>
     </Exec>
   </Actions>

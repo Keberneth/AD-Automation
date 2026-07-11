@@ -85,6 +85,12 @@ AD Hygiene
     [int]$MaxDeletes = 25,
     [switch]$Unlimited,
 
+    # Mirror log lines to the Windows Event Log (Applications and Services Logs >
+    # EventLogName, source = this script). Source registration needs one elevated
+    # run (the installer does it); non-admin runs degrade gracefully.
+    [bool]$EventLogEnabled = $true,
+    [string]$EventLogName = 'AD-Automation',
+
     [string]$ConfigPath = ''
 )
 
@@ -95,8 +101,13 @@ Import-Module $modulePath -Force -ErrorAction Stop
 
 $cfg = Import-ADAutomationConfig -Path $ConfigPath -Section 'DeleteDisabledUsers'
 $boundKeys = @($PSBoundParameters.Keys)
+# Never let a settings-file key flip a mode/safety switch: e.g. 'Unlimited = $true'
+# lifting the MaxDeletes cap, or 'DryRun = $true' clearing an explicitly requested
+# -RequireApprovalList on a live -Run/-Scheduled deletion run.
+$overlaySkip = @('DryRun', 'Run', 'Scheduled', 'RequireApprovalList', 'EmailApprovalList', 'Unlimited')
 foreach ($k in @($cfg.Keys)) {
     if ($k -eq '__ConfigFile') { continue }
+    if ($overlaySkip -contains $k) { Write-Warning "Ignoring config key '$k': run mode/safety switches are set on the command line only."; continue }
     if ($boundKeys -notcontains $k -and (Get-Variable -Name $k -Scope 0 -ErrorAction SilentlyContinue)) {
         Set-Variable -Name $k -Value $cfg[$k] -Scope 0
     }
@@ -151,8 +162,12 @@ function Write-ApprovalListDraft {
         '# Keep only the objects you approve for deletion in the next Run.',
         ''
     )
+    # Write DistinguishedNames, not bare SamAccountNames: sAMAccountName is unique
+    # only per domain, and this script defaults to forest-wide scope, so a bare-SAM
+    # approval could authorise deleting a same-named account in another domain.
+    # Test-IsApproved already matches on DN.
     $set = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($r in $eligible) { [void]$set.Add($r.SamAccountName) }
+    foreach ($r in $eligible) { [void]$set.Add($r.DistinguishedName) }
     $lines += (@($set) | Sort-Object)
     $lines | Set-Content -LiteralPath $Path -Encoding UTF8
     Write-ADAutomationLog "Approval list draft written: $Path (eligible unique count=$($set.Count))" 'INFO'
@@ -194,7 +209,7 @@ function Get-DisableDate {
 }
 
 # --- Setup ------------------------------------------------------------------
-$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName 'ADHygiene-DeleteDisabledUsers'
+$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName 'ADHygiene-DeleteDisabledUsers' -EventLogEnabled $EventLogEnabled -EventLogName $EventLogName
 $CsvReportPath = Join-Path $OutputRoot ("ADHygiene-DeleteDisabledUsers-Report-{0}.csv" -f $run.RunId)
 $ApprovalDraftPath = Join-Path $OutputRoot ("ADHygiene-Delete-ApprovalList-Draft-{0}.txt" -f $run.RunId)
 
@@ -228,7 +243,7 @@ $targets = New-Object System.Collections.Generic.List[object]
 if ($UserLimitToOUs -and @($UserLimitToOUs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
     foreach ($ou in $UserLimitToOUs) {
         if ([string]::IsNullOrWhiteSpace($ou)) { continue }
-        $dcs = [regex]::Matches($ou, 'DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value }
+        $dcs = [regex]::Matches($ou, '(?i)DC=([^,]+)') | ForEach-Object { $_.Groups[1].Value }
         $domainFqdn = ($dcs -join '.')
         if ([string]::IsNullOrWhiteSpace($domainFqdn)) { Write-ADAutomationLog "OU has no DC components (skipping): $ou" 'WARN'; continue }
         $server = $domainFqdn
@@ -249,6 +264,20 @@ else {
     }
 }
 Write-ADAutomationLog ("Targets: {0}" -f (($targets | ForEach-Object { "$($_.Mode):$($_.SearchBase)@$($_.Server)" }) -join ' ; '))
+
+# Recycle Bin preflight: without it, Remove-ADUser is an unrecoverable hard delete
+# (tombstone only, no attribute recovery). Surface the state so operators know the
+# blast radius of the most destructive job in the library.
+try {
+    $rb = Get-ADOptionalFeature -Filter "Name -eq 'Recycle Bin Feature'" -ErrorAction Stop
+    if (-not $rb -or -not $rb.EnabledScopes -or @($rb.EnabledScopes).Count -eq 0) {
+        Write-ADAutomationLog "AD Recycle Bin is NOT enabled in this forest - Remove-ADUser is an UNRECOVERABLE hard delete." 'WARN'
+    }
+    else {
+        Write-ADAutomationLog "AD Recycle Bin is enabled (deleted users are recoverable within the deleted-object lifetime)." 'INFO'
+    }
+}
+catch { Write-ADAutomationLog "Could not determine AD Recycle Bin state (continuing): $($_.Exception.Message)" 'WARN' }
 
 function Invoke-TargetProcessing {
     param($Target)
@@ -279,6 +308,18 @@ function Invoke-TargetProcessing {
             if ($disableDate) { Write-ADAutomationLog "WARN: ReplicationMetadata unavailable for $sam; using whenChanged (unreliable disable timestamp)." 'WARN' }
         }
 
+        # StampAttribute mode trusts a manually written date. An account re-enabled
+        # then re-disabled keeps its OLD stamp, so cross-check the real
+        # userAccountControl replication metadata: if UAC changed well after the
+        # stamp claims, the stamp is stale and must not authorise a delete.
+        if ($DisableDateSource -eq 'StampAttribute' -and $disableDate) {
+            $uacChange = Get-DisableDate -DistinguishedName $dn -AdUser $u -Source 'ReplicationMetadata' -Server $Target.Server -StampAttributeName $DisableStampAttributeName
+            if ($uacChange -and $uacChange -gt $disableDate.AddDays(1)) {
+                Write-ADAutomationLog "WARN: $sam stamp ($($disableDate.ToString('u'))) predates a later userAccountControl change ($($uacChange.ToString('u'))); stamp is stale - skipping." 'WARN'
+                $usedSource = 'StampSupersededByUAC'
+            }
+        }
+
         $eligible = $false; $reason = $null; $daysDisabled = $null
         if (-not $disableDate) { $reason = "Cannot determine disable date (Source=$usedSource). Not eligible." }
         else {
@@ -293,10 +334,18 @@ function Invoke-TargetProcessing {
         $row = [pscustomobject]@{ Domain = $Target.Domain; Server = $Target.Server; SamAccountName = $sam; DistinguishedName = $dn; OU = $ouPath; Enabled = $u.Enabled; WhenChanged = $u.whenChanged; DisableDate = $disableDate; DaysDisabled = $daysDisabled; Eligible = $eligible; Approved = $approved; Action = 'Remove-ADUser'; Result = 'None'; Reason = $reason }
 
         if (-not $eligible) { $row.Result = 'NoChange'; $report.Add($row) | Out-Null; continue }
+        # Defence-in-depth: never delete on an unreliable date (whenChanged fallback,
+        # or a StampAttribute value superseded by a later UAC change). Decide this
+        # BEFORE the DryRun/approval branches and clear Eligible, so the -DryRun
+        # preview and the approval draft match what a real run will actually do
+        # (the draft filters on Eligible).
+        if ($usedSource -eq 'WhenChanged(Fallback)' -or $usedSource -eq 'StampSupersededByUAC') {
+            $row.Eligible = $false
+            Write-ADAutomationLog "SKIP (unreliable date source=$usedSource): $sam" 'SKIP'
+            $row.Result = 'SkippedUnreliableDate'; $report.Add($row) | Out-Null; continue
+        }
         if ($WhatIf) { Write-ADAutomationLog "WHATIF: would delete $sam ; $reason" 'WHATIF'; $row.Result = 'WhatIf'; $report.Add($row) | Out-Null; continue }
         if ($RequireApprovalList -and -not $approved) { Write-ADAutomationLog "SKIP (not approved): $sam" 'SKIP'; $row.Result = 'NotApproved'; $report.Add($row) | Out-Null; continue }
-        # Defence-in-depth: never delete on the unreliable whenChanged fallback.
-        if ($usedSource -eq 'WhenChanged(Fallback)') { Write-ADAutomationLog "SKIP (unreliable date source): $sam eligible by whenChanged only." 'SKIP'; $row.Result = 'SkippedUnreliableDate'; $report.Add($row) | Out-Null; continue }
         if (-not (Test-CanDelete)) { Write-ADAutomationLog "SKIP (MaxDeletes=$MaxDeletes reached): $sam" 'SKIP'; $row.Result = 'MaxDeletesReached'; $report.Add($row) | Out-Null; continue }
 
         try {
@@ -305,7 +354,14 @@ function Invoke-TargetProcessing {
             $script:DeleteCount++
             $row.Result = 'Deleted'
         }
-        catch { Write-ADAutomationLog "ERROR: Delete failed for $sam : $($_.Exception.Message)" 'ERROR'; $row.Result = 'Error' }
+        catch {
+            $msg = $_.Exception.Message
+            # A user with child objects (e.g. Exchange ActiveSync device containers)
+            # cannot be removed with Remove-ADUser; flag it distinctly so it is
+            # actionable instead of re-failing identically on every scheduled run.
+            $row.Result = if ($msg -match '(?i)leaf') { 'ErrorNonLeaf' } else { 'Error' }
+            Write-ADAutomationLog "ERROR: Delete failed for $sam (Result=$($row.Result)): $msg" 'ERROR'
+        }
         $report.Add($row) | Out-Null
     }
 }
@@ -330,8 +386,9 @@ if ($DryRun) {
     catch { Write-ADAutomationLog "ERROR writing approval draft: $($_.Exception.Message)" 'ERROR' }
 
     if ($EmailApprovalList) {
-        if ($SmtpServer -match '(?i)contoso\.') {
-            Write-ADAutomationLog "Refusing to e-mail approval package: SmtpServer still uses the 'contoso' placeholder." 'ERROR'
+        $placeholder = @($SmtpServer, $MailFrom) + @($MailTo) | Where-Object { $_ -match '(?i)contoso\.' }
+        if ($placeholder.Count -gt 0) {
+            Write-ADAutomationLog "Refusing to e-mail approval package: still uses the 'contoso' placeholder ($($placeholder -join ', ')). Configure SmtpServer/MailFrom/MailTo in config\AD-Automation.settings.psd1." 'ERROR'
         }
         else {
             $attachments = @($CsvReportPath, $ApprovalDraftPath, $run.LogPath)

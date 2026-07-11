@@ -20,7 +20,7 @@ can review, hand to another admin, or deploy by GPO.
 | `ADAuto-PasswordChangeAudit.xml` | Every 30 min | `-Run` |
 | `ADAuto-DisableInactive.xml` | Daily 02:00 | **`-DryRun`** |
 | `ADAuto-DeleteDisabled.xml` | Weekly Sun 03:00 | **`-DryRun`** |
-| `ADAuto-ServerGroups.xml` | Daily 04:00 | *(none)* |
+| `ADAuto-ServerGroups.xml` | Daily 04:00 | **`-WhatIf`** |
 
 `Build-TaskXml.ps1` is the generator that produced them (via the Task Scheduler
 API, so the XML is guaranteed valid). Re-run it any time you want to change the
@@ -31,8 +31,9 @@ run-as account, the script location, or a schedule — see **Customise** below.
 1. **Run-as = `SYSTEM`** (`S-1-5-18`). Simplest and password-free, but only has AD
    rights when the task runs **on a Domain Controller**. On a non-DC host, change
    the account (see Customise).
-2. **The destructive jobs are in `-DryRun`** — they only write a report, they
-   change nothing. Flip them to live when you're ready (see Go live).
+2. **The AD-writing jobs ship in preview** — `DisableInactive`/`DeleteDisabled` in
+   `-DryRun` and `ServerGroups` in `-WhatIf`. They change nothing until you flip
+   them live (see Go live).
 
 The scripts are assumed to live in **`C:\AD-Automation`**. If yours are elsewhere,
 regenerate with `-ScriptRoot` (see Customise) — don't just move the files.
@@ -82,15 +83,17 @@ For a **gMSA** (recommended, no stored password): regenerate with
 schtasks /Create /TN "AD-Automation\ADAuto-PasswordExpiry" /XML "ADAuto-PasswordExpiry.xml" /RU SYSTEM
 ```
 
-## Go live (the disable / delete jobs)
+## Go live (the AD-writing jobs)
 
-`ADAuto-DisableInactive.xml` and `ADAuto-DeleteDisabled.xml` ship in `-DryRun`.
-Review the reports under `C:\ProgramData\AD-Automation`, then either:
+`ADAuto-DisableInactive.xml` and `ADAuto-DeleteDisabled.xml` ship in `-DryRun`, and
+`ADAuto-ServerGroups.xml` ships in `-WhatIf`. Review the reports/log under
+`C:\ProgramData\AD-Automation`, then either:
 
-- **regenerate** with live args — edit the two `Args = '-DryRun'` rows in
-  `Build-TaskXml.ps1` to `'-Scheduled'` and re-run it; or
-- **edit in place** — change `-DryRun` to `-Scheduled` in the `<Arguments>` line of
-  those two files (or on the task's **Actions** tab after import).
+- **regenerate** with live args — edit the relevant `Args` rows in
+  `Build-TaskXml.ps1` (`'-DryRun'` → `'-Scheduled'`, `'-WhatIf'` → `''`) and re-run
+  it; or
+- **edit in place** — change the switch in the `<Arguments>` line of those files (or
+  on the task's **Actions** tab after import).
 
 No approval list is needed for hands-off operation; `-RequireApprovalList` is
 optional manual change-control only. See the root [README](../README.md).

@@ -39,10 +39,6 @@
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>
     <Priority>7</Priority>
-    <RestartOnFailure>
-      <Interval>PT5M</Interval>
-      <Count>2</Count>
-    </RestartOnFailure>
   </Settings>
   <Actions>
     <Exec>

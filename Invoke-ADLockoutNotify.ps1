@@ -37,6 +37,10 @@ param(
 
     [ValidateRange(1, 10080)][int]$LookbackMinutes = 15,
 
+    # Cap how far back a catch-up (after a missed/late run) may reach, so a long
+    # outage cannot trigger an enormous Security-log scan. Default 1 day.
+    [ValidateRange(1, 43200)][int]$MaxCatchupMinutes = 1440,
+
     # DC whose Security log to read. Empty = PDC emulator.
     [string]$DcServer = '',
     # Query every DC in the domain (full coverage) instead of just one.
@@ -53,6 +57,12 @@ param(
 
     [string]$OutputRoot = 'C:\ProgramData\AD-Automation',
     [string]$LogFilePrefix = 'ADLockout',
+
+    # Mirror log lines to the Windows Event Log (Applications and Services Logs >
+    # EventLogName, source = this script). Source registration needs one elevated
+    # run (the installer does it); non-admin runs degrade gracefully.
+    [bool]$EventLogEnabled = $true,
+    [string]$EventLogName = 'AD-Automation',
 
     [string]$ConfigPath = ''
 )
@@ -77,10 +87,9 @@ if (-not (Get-Module -ListAvailable -Name ActiveDirectory)) {
 Import-Module ActiveDirectory -ErrorAction Stop
 
 # --- Setup ------------------------------------------------------------------
-$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName $LogFilePrefix
+$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName $LogFilePrefix -EventLogEnabled $EventLogEnabled -EventLogName $EventLogName
 $CsvPath = Join-Path $OutputRoot ("{0}-Report-{1}.csv" -f $LogFilePrefix, $run.RunId)
 $whatIf = ($PSCmdlet.ParameterSetName -eq 'DryRun')
-$startTime = (Get-Date).AddMinutes(-$LookbackMinutes)
 
 $mailCommon = @{
     From = $MailFrom; SmtpServer = $SmtpServer; SmtpPort = $SmtpPort
@@ -104,19 +113,42 @@ else {
     }
 }
 
+# Per-DC high-water mark state (so overlapping runs do not resend). A corrupt state
+# file here only risks a few duplicate mails within the lookback window (not missed
+# detections), so degrade to empty watermarks instead of aborting the whole run.
+$statePath = Get-ADAutomationStatePath -OutputRoot $OutputRoot -Name 'LockoutNotify'
+$state = $null
+try { $state = Read-ADAutomationState -Path $statePath }
+catch { Write-ADAutomationLog "Lockout state unreadable ($($_.Exception.Message)); continuing with empty watermarks (may re-send within the lookback window)." 'WARN' }
+$watermarks = @{}
+if ($state -and $state.PSObject.Properties['Watermarks']) {
+    foreach ($p in $state.Watermarks.PSObject.Properties) { $watermarks[$p.Name] = [int64]$p.Value }
+}
+
+# Query window: normally now-LookbackMinutes, but reach back to the last successful
+# run so a skipped/delayed cycle is caught up (the per-DC watermark still dedupes
+# the overlap). Cap the reach at MaxCatchupMinutes so a long outage cannot scan the
+# whole log.
+$startTime = (Get-Date).AddMinutes(-$LookbackMinutes)
+if ($state -and $state.PSObject.Properties['UpdatedUtc'] -and -not [string]::IsNullOrWhiteSpace($state.UpdatedUtc)) {
+    try {
+        $lastRun = ([datetime]::Parse($state.UpdatedUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
+        $floor = (Get-Date).AddMinutes(-$MaxCatchupMinutes)
+        if ($lastRun -lt $floor) { $lastRun = $floor }
+        if ($lastRun -lt $startTime) { $startTime = $lastRun }
+    }
+    catch { }
+}
+
 Write-ADAutomationLog "=== START (RunId=$($run.RunId)) ==="
 Write-ADAutomationLog ("Mode={0} ; WhatIf={1} ; LookbackMinutes={2} ; StartTime={3} ; DCs={4}" -f `
         $PSCmdlet.ParameterSetName, $whatIf, $LookbackMinutes, $startTime, ($dcList -join ', '))
 Write-ADAutomationLog ("SMTP={0}:{1} From={2} SSL={3} AdminTo={4} NotifyUser={5}" -f `
         $SmtpServer, $SmtpPort, $MailFrom, $MailUseSsl, ($AdminMailTo -join ','), $NotifyUser)
 
-# Per-DC high-water mark state (so overlapping runs do not resend).
-$statePath = Get-ADAutomationStatePath -OutputRoot $OutputRoot -Name 'LockoutNotify'
-$state = Read-ADAutomationState -Path $statePath
-$watermarks = @{}
-if ($state -and $state.PSObject.Properties['Watermarks']) {
-    foreach ($p in $state.Watermarks.PSObject.Properties) { $watermarks[$p.Name] = [int64]$p.Value }
-}
+# Run-level de-duplication of the same lockout reported by more than one DC
+# (a 4740 is commonly written on both the enforcing DC and the PDC emulator).
+$seenLockouts = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
 $mailRegex = '^[^@\s,;:<>"]+@[^@\s,;:<>"]+\.[^@\s,;:<>"]+$'
 function Get-Clean([string]$s) {
@@ -139,9 +171,11 @@ foreach ($dc in $dcList) {
         } -ErrorAction Stop
     }
     catch {
-        # "No events were found" is not an error; anything else is logged.
-        if ($_.Exception.Message -match 'No events were found') {
-            Write-ADAutomationLog "No lockout events on $dc in the last $LookbackMinutes min." 'INFO'
+        # "No events were found" is not an error. Match the locale-invariant error
+        # id, not the message text (which is translated on non-English Windows and
+        # would otherwise log a spurious ERROR every quiet run).
+        if ($_.FullyQualifiedErrorId -match '^NoMatchingEventsFound') {
+            Write-ADAutomationLog "No lockout events on $dc in the window." 'INFO'
         }
         else {
             Write-ADAutomationLog "ERROR reading Security log on '$dc': $($_.Exception.Message)" 'ERROR'
@@ -149,8 +183,26 @@ foreach ($dc in $dcList) {
         continue
     }
 
-    $events = @($events | Where-Object { [int64]$_.RecordId -gt $lastId } | Sort-Object RecordId)
+    # Detect a cleared/recreated Security log: EventRecordId restarts near 1, so if
+    # the newest event in the window is BELOW our stored watermark, the old watermark
+    # is stale and would suppress every future alert on this DC. Reset it.
+    $rawEvents = @($events)
+    if ($rawEvents.Count -gt 0 -and $lastId -gt 0) {
+        $windowMax = [int64](($rawEvents | Measure-Object -Property RecordId -Maximum).Maximum)
+        if ($windowMax -lt $lastId) {
+            Write-ADAutomationLog "RecordId regression on $dc (newest=$windowMax < watermark=$lastId): Security log likely cleared/recreated; resetting watermark." 'WARN'
+            $lastId = [int64]0
+        }
+    }
+
+    $events = @($rawEvents | Where-Object { [int64]$_.RecordId -gt $lastId } | Sort-Object RecordId)
     if ($events.Count -eq 0) { continue }
+
+    # Advance the watermark only across a CONTIGUOUS prefix of successfully-notified
+    # events, so a failed send (transient SMTP outage) leaves that event and later
+    # ones to be retried next run instead of being skipped forever.
+    $watermarkCandidate = $lastId
+    $stopAdvance = $false
 
     foreach ($evt in $events) {
         $xml = [xml]$evt.ToXml()
@@ -188,6 +240,10 @@ foreach ($dc in $dcList) {
             $resolveStatus = 'BadMail'
         }
 
+        # De-duplicate the same lockout reported by multiple DCs in one run.
+        $dedupKey = "{0}|{1}|{2}" -f $lockedUser, $domain, ($time.ToString('yyyyMMddHHmm'))
+        $isDuplicate = -not $seenLockouts.Add($dedupKey)
+
         $report.Add([pscustomobject]@{
                 TimeCreated   = $time
                 Dc            = $dc
@@ -197,6 +253,7 @@ foreach ($dc in $dcList) {
                 UserMail      = $userMail
                 ResolveStatus = $resolveStatus
                 EventRecordId = $evt.RecordId
+                Duplicate     = $isDuplicate
             }) | Out-Null
 
         $subject = "AD Lockout: $lockedUser @ $domain"
@@ -210,22 +267,33 @@ Event record id: $($evt.RecordId)
 Reported by DC: $dc
 "@
 
-        if ($whatIf) {
+        $eventOk = $true
+        if ($isDuplicate) {
+            Write-ADAutomationLog "Duplicate lockout already reported this run for $lockedUser @ $domain (DC=$dc); not re-sending." 'INFO'
+        }
+        elseif ($whatIf) {
             Write-ADAutomationLog "WHATIF: would notify admins$(if ($NotifyUser -and $userMail) { " + user($userMail)" }) for $lockedUser / caller=$caller (DC=$dc)" 'WHATIF'
         }
         else {
-            [void](Send-ADAutomationMail @mailCommon -To $AdminMailTo -Subject $subject -Body $body)
+            $eventOk = [bool](Send-ADAutomationMail @mailCommon -To $AdminMailTo -Subject $subject -Body $body)
             if ($NotifyUser -and $userMail) {
                 [void](Send-ADAutomationMail @mailCommon -To @($userMail) -Subject $subject -Body $body)
             }
         }
+
+        # Advance the watermark only across a contiguous prefix of handled events. A
+        # duplicate counts as handled; a failed admin send stops advancement so the
+        # event (and later ones) are retried on the next run.
+        if (-not $whatIf) {
+            if ($eventOk -and -not $stopAdvance) { $watermarkCandidate = [int64]$evt.RecordId }
+            elseif (-not $eventOk) { $stopAdvance = $true; Write-ADAutomationLog "Admin notification failed for RecordId=$($evt.RecordId) on $dc; will retry next run." 'WARN' }
+        }
     }
 
-    # Advance the watermark only after a real Run, so DryRun never suppresses real alerts.
+    # Persist the advanced watermark (real runs only); DryRun never suppresses alerts.
     if (-not $whatIf) {
-        $maxId = ($events | Measure-Object -Property RecordId -Maximum).Maximum
-        $watermarks[$dc] = [int64]$maxId
-        Write-ADAutomationLog "Watermark for $dc advanced to RecordId=$maxId" 'INFO'
+        $watermarks[$dc] = [int64]$watermarkCandidate
+        Write-ADAutomationLog "Watermark for $dc set to RecordId=$watermarkCandidate" 'INFO'
     }
 }
 

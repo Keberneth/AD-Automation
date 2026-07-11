@@ -69,7 +69,7 @@ $tasks = @(
     [pscustomobject]@{ Key = 'PasswordChangeAudit'; Script = 'Invoke-ADPasswordChangeAudit.ps1'; Args = '-Run'; Desc = 'AD-Automation: on password change, run duplicate + Have I Been Pwned checks'; Sched = @{ Type = 'Minute'; Every = 30 } }
     [pscustomobject]@{ Key = 'DisableInactive'; Script = 'Invoke-ADHygieneDisableInactive.ps1'; Args = '-DryRun'; Desc = 'AD-Automation: disable inactive users/computers (DryRun - switch to -Scheduled to go live)'; Sched = @{ Type = 'Daily'; At = '02:00' } }
     [pscustomobject]@{ Key = 'DeleteDisabled'; Script = 'Invoke-ADHygieneDeleteDisabledUsers.ps1'; Args = '-DryRun'; Desc = 'AD-Automation: delete users disabled for >= N days (DryRun - switch to -Scheduled to go live)'; Sched = @{ Type = 'Weekly'; At = '03:00'; Dow = $DOW_SUNDAY } }
-    [pscustomobject]@{ Key = 'ServerGroups'; Script = 'Invoke-ADServerGroupProvisioning.ps1'; Args = ''; Desc = 'AD-Automation: create per-server Admin/RDP groups and nest baselines'; Sched = @{ Type = 'Daily'; At = '04:00' } }
+    [pscustomobject]@{ Key = 'ServerGroups'; Script = 'Invoke-ADServerGroupProvisioning.ps1'; Args = '-WhatIf'; Desc = 'AD-Automation: create per-server Admin/RDP groups and nest baselines (WhatIf - remove -WhatIf to go live)'; Sched = @{ Type = 'Daily'; At = '04:00' } }
 )
 
 if (-not (Test-Path -LiteralPath $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
@@ -101,9 +101,12 @@ foreach ($t in $tasks) {
             $trg = $td.Triggers.Create($T_TIME)
             $trg.StartBoundary = '{0}T00:00:00' -f $anchor
             $trg.Repetition.Interval = 'PT{0}M' -f $t.Sched.Every
-            $trg.Repetition.Duration = 'P3650D'      # ~10 years (matches the installer)
+            # No Duration => repeat INDEFINITELY. A fixed Duration anchored to the
+            # hard-coded StartBoundary would make these security tasks silently stop
+            # firing on that date + duration, regardless of when they were imported.
             $trg.Repetition.StopAtDurationEnd = $false
         }
+        default { throw "Unknown Sched.Type '$($t.Sched.Type)' for task '$($t.Key)'." }
     }
     $trg.Enabled = $true
 
@@ -126,8 +129,13 @@ foreach ($t in $tasks) {
     $s.ExecutionTimeLimit = 'PT2H'
     $s.DisallowStartIfOnBatteries = $false
     $s.StopIfGoingOnBatteries = $false
-    $s.RestartCount = 2
-    $s.RestartInterval = 'PT5M'
+    # No restart-on-failure for the destructive jobs: a restart after a partial run
+    # would delete/disable the NEXT batch, multiplying the per-run MaxDeletes/
+    # MaxChanges safety cap. The cap is per PROCESS.
+    if ($t.Key -notin @('DisableInactive', 'DeleteDisabled')) {
+        $s.RestartCount = 2
+        $s.RestartInterval = 'PT5M'
+    }
     $s.IdleSettings.StopOnIdleEnd = $false
     $s.Enabled = $true
 

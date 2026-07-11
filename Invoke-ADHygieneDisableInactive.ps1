@@ -107,9 +107,19 @@ AD Hygiene
     [bool]$SkipIfAlreadyInTargetOU = $true,
 
     # Max objects changed per run (per object, not per action). 0 = unlimited.
-    [int]$MaxChanges = 0,
+    # Defaults to a modest blast-radius cap (matching the sibling delete job's
+    # MaxDeletes) so a threshold/clock anomaly cannot disable a whole domain in one
+    # unattended run; raise it or set 0 explicitly once you trust a live run.
+    [int]$MaxChanges = 25,
 
     [string]$Server = '',
+
+    # Mirror log lines to the Windows Event Log (Applications and Services Logs >
+    # EventLogName, source = this script). Source registration needs one elevated
+    # run (the installer does it); non-admin runs degrade gracefully.
+    [bool]$EventLogEnabled = $true,
+    [string]$EventLogName = 'AD-Automation',
+
     [string]$ConfigPath = ''
 )
 
@@ -120,8 +130,13 @@ Import-Module $modulePath -Force -ErrorAction Stop
 
 $cfg = Import-ADAutomationConfig -Path $ConfigPath -Section 'DisableInactive'
 $boundKeys = @($PSBoundParameters.Keys)
+# Mode/safety switches are decided by the invocation (parameter set / command line)
+# only. Never let a settings-file key flip them - e.g. 'DryRun = $true' in config
+# must not silently disable -RequireApprovalList on a live -Scheduled run.
+$overlaySkip = @('DryRun', 'Run', 'Scheduled', 'RequireApprovalList', 'EmailApprovalList', 'Unlimited')
 foreach ($k in @($cfg.Keys)) {
     if ($k -eq '__ConfigFile') { continue }
+    if ($overlaySkip -contains $k) { Write-Warning "Ignoring config key '$k': run mode/safety switches are set on the command line only."; continue }
     if ($boundKeys -notcontains $k -and (Get-Variable -Name $k -Scope 0 -ErrorAction SilentlyContinue)) {
         Set-Variable -Name $k -Value $cfg[$k] -Scope 0
     }
@@ -206,7 +221,7 @@ function Write-ApprovalListDraft {
 }
 
 # --- Setup ------------------------------------------------------------------
-$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName 'ADHygiene-DisableInactive'
+$run = Initialize-ADAutomationLog -OutputRoot $OutputRoot -BaseName 'ADHygiene-DisableInactive' -EventLogEnabled $EventLogEnabled -EventLogName $EventLogName
 $CsvReportPath = Join-Path $OutputRoot ("ADHygiene-DisableInactive-Report-{0}.csv" -f $run.RunId)
 $ApprovalDraftPath = Join-Path $OutputRoot ("ADHygiene-ApprovalList-Draft-{0}.txt" -f $run.RunId)
 
@@ -260,6 +275,13 @@ foreach ($t in @($MoveDisabledUsersToOU, $MoveDisabledServiceAccountsToOU, $Move
 
 $userBases = Get-ValidSearchBase -Bases $UserLimitToOUs @srv
 $compBases = Get-ValidSearchBase -Bases $ComputerLimitToOUs @srv
+
+# If EVERY configured/derived base is invalid (domain-detection failure, a domain
+# rename, or all OUs mistyped) the run would otherwise scan nothing and report a
+# successful no-op - hiding a broken hygiene job. Fail loudly instead.
+if (@($userBases).Count -eq 0 -and @($compBases).Count -eq 0) {
+    throw "No valid AD search bases resolved (users or computers). Check UserLimitToOUs/ComputerLimitToOUs and that the domain is reachable."
+}
 
 $userCutoff = (Get-Date).AddDays(-$UserInactiveForDays)
 $userNeverCutoff = (Get-Date).AddDays(-$UserNeverLoggedOnMinAccountAgeDays)
@@ -360,10 +382,14 @@ function Invoke-UserOuProcessing {
         try { Disable-ADAccount -Identity $dn @srv -ErrorAction Stop; Write-ADAutomationLog "USERS ACTION: Disabled: $sam" 'ACTION' }
         catch { $ok = $false; Write-ADAutomationLog "USERS ERROR: Disable $sam : $($_.Exception.Message)" 'ERROR' }
 
-        if ($willMove) {
+        # Only move once the disable actually succeeded, so a failed disable never
+        # parks a still-ENABLED account in the 'Disabled' OU (where a later run,
+        # scoped to source OUs, may never revisit it).
+        if ($willMove -and $ok) {
             try { Move-ADObject -Identity $dn @srv -TargetPath $targetOU -ErrorAction Stop; Write-ADAutomationLog "USERS ACTION: Moved: $sam -> $targetOU" 'ACTION' }
             catch { $ok = $false; Write-ADAutomationLog "USERS ERROR: Move $sam : $($_.Exception.Message)" 'ERROR' }
         }
+        elseif ($willMove) { Write-ADAutomationLog "USERS SKIP move (disable failed): $sam" 'SKIP' }
 
         $row.Result = if ($ok) { 'Changed' } else { 'Error' }
         $report.Add($row) | Out-Null
@@ -376,8 +402,11 @@ function Invoke-ComputerOuProcessing {
     param([string]$SearchBaseOU)
     Write-ADAutomationLog "--- COMPUTERS: $SearchBaseOU ---"
     try {
+        # Exclude domain controllers (SERVER_TRUST_ACCOUNT 8192) and RODCs
+        # (PARTIAL_SECRETS_ACCOUNT 67108864): a DC offline past the threshold must
+        # never be disabled/moved out of OU=Domain Controllers by an unattended run.
         $computers = Get-ADComputer -SearchBase $SearchBaseOU -SearchScope $scope @srv `
-            -LDAPFilter '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2)))' `
+            -LDAPFilter '(&(objectCategory=computer)(!(userAccountControl:1.2.840.113556.1.4.803:=2))(!(userAccountControl:1.2.840.113556.1.4.803:=8192))(!(userAccountControl:1.2.840.113556.1.4.803:=67108864)))' `
             -Properties LastLogonDate, whenCreated, DistinguishedName, SamAccountName, Enabled -ErrorAction Stop
     }
     catch {
@@ -426,10 +455,11 @@ function Invoke-ComputerOuProcessing {
         $ok = $true
         try { Disable-ADAccount -Identity $dn @srv -ErrorAction Stop; Write-ADAutomationLog "COMPUTERS ACTION: Disabled: $sam" 'ACTION' }
         catch { $ok = $false; Write-ADAutomationLog "COMPUTERS ERROR: Disable $sam : $($_.Exception.Message)" 'ERROR' }
-        if ($willMove) {
+        if ($willMove -and $ok) {
             try { Move-ADObject -Identity $dn @srv -TargetPath $MoveDisabledComputersToOU -ErrorAction Stop; Write-ADAutomationLog "COMPUTERS ACTION: Moved: $sam -> $MoveDisabledComputersToOU" 'ACTION' }
             catch { $ok = $false; Write-ADAutomationLog "COMPUTERS ERROR: Move $sam : $($_.Exception.Message)" 'ERROR' }
         }
+        elseif ($willMove) { Write-ADAutomationLog "COMPUTERS SKIP move (disable failed): $sam" 'SKIP' }
 
         $row.Result = if ($ok) { 'Changed' } else { 'Error' }
         $report.Add($row) | Out-Null
@@ -458,8 +488,13 @@ if ($DryRun) {
     catch { Write-ADAutomationLog "ERROR writing approval draft: $($_.Exception.Message)" 'ERROR' }
 
     if ($EmailApprovalList) {
-        if ($SmtpServer -match '(?i)contoso\.') {
-            Write-ADAutomationLog "Refusing to e-mail approval package: SmtpServer still uses the 'contoso' placeholder. Configure config\AD-Automation.settings.psd1." 'ERROR'
+        # Guard every placeholder-bearing field, not just SmtpServer: MailTo defaults
+        # to the contoso placeholder and the sample config supplies no MailTo for this
+        # script, so a real relay would otherwise hand the account inventory to an
+        # address the operator does not control.
+        $placeholder = @($SmtpServer, $MailFrom) + @($MailTo) | Where-Object { $_ -match '(?i)contoso\.' }
+        if ($placeholder.Count -gt 0) {
+            Write-ADAutomationLog "Refusing to e-mail approval package: still uses the 'contoso' placeholder ($($placeholder -join ', ')). Configure SmtpServer/MailFrom/MailTo in config\AD-Automation.settings.psd1." 'ERROR'
         }
         else {
             $attachments = @($CsvReportPath, $ApprovalDraftPath, $run.LogPath)

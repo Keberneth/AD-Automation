@@ -1,6 +1,6 @@
 @{
     RootModule        = 'ADAutomation.psm1'
-    ModuleVersion     = '1.0.0'
+    ModuleVersion     = '1.1.0'
     GUID              = '328f28f7-792f-44d2-8537-718883d91592'
     Author            = 'AD-Automation'
     CompanyName       = 'AD-Automation'
@@ -12,6 +12,7 @@
         'Import-ADAutomationConfig',
         'Initialize-ADAutomationLog',
         'Protect-ADAutomationDirectory',
+        'Register-ADAutomationEventLog',
         'Write-ADAutomationLog',
         'Send-ADAutomationMail',
         'Get-ADAutomationDomainInfo',
